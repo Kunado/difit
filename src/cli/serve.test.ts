@@ -602,7 +602,13 @@ describe('difit comment', () => {
   it('finds the session from the pages, trailing slash, query, and fragment of the PR', async () => {
     await serveWithPr();
 
-    const add = await runCli(['comment', 'add', '--pr', `${PR_A}/files`, comment('t3', 'via page')]);
+    const add = await runCli([
+      'comment',
+      'add',
+      '--pr',
+      `${PR_A}/files`,
+      comment('t3', 'via page'),
+    ]);
     const get = await runCli(['comment', 'get', '--pr', `${PR_A}/?x=1#y`, '--format', 'json']);
 
     expect(add.code).toBe(0);
