@@ -41,8 +41,6 @@ interface SessionEntry {
   readonly createdAt: string;
   readonly repositoryId: string;
   readonly session: ReviewSession;
-  /** Open watch and heartbeat responses, ended when the session is deleted. */
-  readonly streams: Set<Response>;
   /** Set by `clean`; consumed by the first /api/diff response. */
   pendingClean: boolean;
 }
@@ -60,7 +58,6 @@ const GH_FAILURE_ERROR =
 
 const SESSION_ID_LENGTH = 16;
 const MAX_BODY_SIZE = '1mb';
-const SSE_PATHS = new Set(['/api/watch', '/api/heartbeat']);
 const LOOPBACK_HOST_NAMES = ['localhost', '127.0.0.1', '[::1]'];
 const LISTEN_HOSTS = new Set(['localhost', '127.0.0.1']);
 const GITHUB_TOKEN_PATTERN = /\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+/g;
@@ -250,7 +247,6 @@ export function createMultiSessionApp({ github }: { github: PullRequestSource })
       createdAt: new Date().toISOString(),
       repositoryId,
       session,
-      streams: new Set(),
       pendingClean: clean,
     };
   }
@@ -333,12 +329,6 @@ export function createMultiSessionApp({ github }: { github: PullRequestSource })
     }
     sessions.delete(entry.id);
     await entry.session.dispose();
-    for (const stream of entry.streams) {
-      // The heartbeat timer stops on the request's close event, which follows end().
-      // A tick in between writes after end; that error is expected and harmless.
-      stream.on('error', () => {});
-      stream.end();
-    }
     res.json({ success: true, id: entry.id });
   });
 
@@ -350,10 +340,6 @@ export function createMultiSessionApp({ github }: { github: PullRequestSource })
     }
     // Express matches routes ignoring case and one trailing slash; compare the same way.
     const routePath = req.path.toLowerCase().replace(/\/$/, '');
-    if ((req.method === 'GET' || req.method === 'HEAD') && SSE_PATHS.has(routePath)) {
-      entry.streams.add(res);
-      res.on('close', () => entry.streams.delete(res));
-    }
     if (entry.pendingClean && req.method === 'GET' && routePath === '/api/diff') {
       announceCleanOnce(entry, res);
     }
