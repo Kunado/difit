@@ -37,6 +37,10 @@ export default defineConfig({
         target: apiTarget,
         changeOrigin: true,
       },
+      '^/s/[0-9a-f]{16}/api/': {
+        target: apiTarget,
+        changeOrigin: true,
+      },
     },
   },
 });
