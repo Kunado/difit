@@ -905,6 +905,24 @@ describe('request guards', () => {
     expect(sameOriginRead.status).toBe(200);
   });
 
+  it('lets the session list page close a session with a bodiless DELETE', async () => {
+    const { base, port } = await startApp();
+    const a = await openPr(base, PR_A);
+    const host = `127.0.0.1:${port}`;
+
+    // What a browser sends for the list page's fetch: its own Origin, and the
+    // Content-Type the page sets, with no body.
+    const del = await rawRequest(port, {
+      method: 'DELETE',
+      path: `/api/sessions/${a.id}`,
+      headers: { Host: host, Origin: `http://${host}`, 'Content-Type': 'application/json' },
+    });
+
+    expect(del.status).toBe(200);
+    expect(JSON.parse(del.body)).toEqual({ success: true, id: a.id });
+    expect(await listSessions(base)).toEqual([]);
+  });
+
   it('requires a JSON content type on session writes', async () => {
     const { base, github } = await startApp();
     const a = await openPr(base, PR_A);
@@ -998,6 +1016,16 @@ describe('review pages', () => {
       expect(response.headers.get('content-type')).toMatch(/^text\/html/);
       expect(await response.text()).toBe(INDEX_HTML);
     }
+  });
+
+  it('serves the client page at /, where it lists the open PRs', async () => {
+    const { base } = await startApp(fakeGitHub(), { clientDir });
+
+    const response = await fetch(`${base}/`);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toMatch(/^text\/html/);
+    expect(await response.text()).toBe(INDEX_HTML);
   });
 
   it('serves the client from under a dot directory, as with npx in ~/.npm', async () => {
