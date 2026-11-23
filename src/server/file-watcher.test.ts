@@ -26,6 +26,15 @@ const TEST_REPO_PATH = resolve('/test/path');
 const TEST_WORKTREE_PATH = resolve('/worktree/path');
 const TEST_REPOS_WORKTREE_PATH = resolve('/repos/worktree');
 
+// A promise the test resolves by hand.
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
 describe('FileWatcherService', () => {
   let fileWatcher: FileWatcherService;
   let mockResponse: Response;
@@ -120,6 +129,32 @@ describe('FileWatcherService', () => {
 
       // After stop, adding client should work normally (clients array should be cleared)
       expect(() => fileWatcher.addClient(mockResponse)).not.toThrow();
+    });
+  });
+
+  describe('after stop()', () => {
+    it('releases a subscription that resolves after stop()', async () => {
+      const subscribed = deferred<typeof mockSubscription>();
+      vi.mocked(subscribe).mockReturnValueOnce(subscribed.promise);
+
+      const starting = fileWatcher.start(DiffMode.DEFAULT, TEST_REPO_PATH, 300);
+      await vi.waitFor(() => expect(subscribe).toHaveBeenCalledTimes(1));
+      await fileWatcher.stop();
+      subscribed.resolve(mockSubscription);
+      await starting;
+
+      expect(mockSubscription.unsubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it('releases every subscription of a start() that stop() overtook', async () => {
+      // The order of startWatching() followed at once by dispose().
+      const starting = fileWatcher.start(DiffMode.WORKING, TEST_REPO_PATH, 300);
+      await fileWatcher.stop();
+      await starting;
+
+      expect(mockSubscription.unsubscribe).toHaveBeenCalledTimes(
+        vi.mocked(subscribe).mock.calls.length,
+      );
     });
   });
 
