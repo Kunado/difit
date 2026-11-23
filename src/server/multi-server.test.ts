@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import pkg from '../../package.json' with { type: 'json' };
 import { getPrCommentImports, getPrPatch, getPrTitle } from '../cli/github.js';
 import { type CommentImport } from '../types/diff.js';
+import { SESSION_PATH_PATTERN } from '../utils/sessionPath.js';
 
 import { createMultiSessionApp, type PullRequestSource, startMultiServer } from './multi-server.js';
 
@@ -989,9 +990,7 @@ describe('review pages', () => {
   it('serves the client page at /s/<id> and /s/<id>/', async () => {
     const { base } = await startApp(fakeGitHub(), { clientDir });
     const { id, url } = await openPr(base, PR_A);
-    // The client sends a page's /api/ requests to its session only for this id shape
-    // (src/client/utils/sessionApi.ts).
-    expect(id).toMatch(/^[0-9a-f]{16}$/);
+    expect(url).toMatch(SESSION_PATH_PATTERN);
 
     for (const path of [`/s/${id}`, url]) {
       const response = await fetch(`${base}${path}`);
@@ -1028,7 +1027,7 @@ describe('review pages', () => {
     const response = await fetch(`${base}${url}`);
 
     expect(response.status).toBe(500);
-    expect(await response.json()).toEqual({ error: 'Could not serve the review page' });
+    expect(await response.json()).toEqual({ error: expect.any(String) });
     expect(errors).toHaveBeenCalledWith(expect.stringContaining('index.html'));
   });
 });

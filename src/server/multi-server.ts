@@ -3,12 +3,15 @@
 // bundles server.ts, does not ship it.
 import { createHash } from 'crypto';
 import { type Server } from 'http';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
 
 import pkg from '../../package.json' with { type: 'json' };
 import { type CommentImport } from '../types/diff.js';
 import { normalizeCommentImports } from '../utils/commentImports.js';
+import { SESSION_ID_LENGTH } from '../utils/sessionPath.js';
 
 import { createReviewSession, type ReviewSession, startServerWithFallback } from './server.js';
 
@@ -56,8 +59,8 @@ const PR_URL_ERROR =
 const GH_FAILURE_ERROR =
   'Could not fetch the pull request with gh. Check that it exists and that gh is installed and logged in (gh auth status). The server log has the details.';
 
-const SESSION_ID_LENGTH = 16;
 const MAX_BODY_SIZE = '1mb';
+const DEFAULT_CLIENT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'client');
 const LOOPBACK_HOST_NAMES = ['localhost', '127.0.0.1', '[::1]'];
 const LISTEN_HOSTS = new Set(['localhost', '127.0.0.1']);
 const GITHUB_TOKEN_PATTERN = /\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+/g;
@@ -208,7 +211,23 @@ function announceCleanOnce(entry: SessionEntry, res: Response): void {
   };
 }
 
-export function createMultiSessionApp({ github }: { github: PullRequestSource }): Express {
+function sendReviewPage(clientDir: string, res: Response): void {
+  const indexPath = join(clientDir, 'index.html');
+  res.sendFile(indexPath, (error) => {
+    if (error && !res.headersSent) {
+      console.error(`Could not serve ${indexPath}: ${describeError(error)}`);
+      res.status(500).json({ error: 'Could not serve the review page' });
+    }
+  });
+}
+
+export function createMultiSessionApp({
+  github,
+  clientDir = DEFAULT_CLIENT_DIR,
+}: {
+  github: PullRequestSource;
+  clientDir?: string;
+}): Express {
   const startedAt = new Date().toISOString();
   // Insertion order is creation order, which GET /api/sessions reports.
   const sessions = new Map<string, SessionEntry>();
@@ -340,11 +359,17 @@ export function createMultiSessionApp({ github }: { github: PullRequestSource })
     }
     // Express matches routes ignoring case and one trailing slash; compare the same way.
     const routePath = req.path.toLowerCase().replace(/\/$/, '');
+    if (routePath === '' && (req.method === 'GET' || req.method === 'HEAD')) {
+      sendReviewPage(clientDir, res);
+      return;
+    }
     if (entry.pendingClean && req.method === 'GET' && routePath === '/api/diff') {
       announceCleanOnce(entry, res);
     }
     entry.session.router(req, res, next);
   });
+
+  app.use(express.static(clientDir, { index: false }));
 
   app.use((_req, res) => {
     res.status(404).json({ error: 'Not found' });
