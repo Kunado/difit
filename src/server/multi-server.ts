@@ -187,7 +187,7 @@ function handleError(error: unknown, _req: Request, res: Response, next: NextFun
       .json({ error: status === 413 ? 'Request body too large' : 'Invalid request body' });
     return;
   }
-  console.error('Unexpected error in the multi-session server:', error);
+  console.error(`Unexpected error in the multi-session server: ${describeError(error)}`);
   res.status(500).json({ error: 'Internal server error' });
 }
 
@@ -309,7 +309,7 @@ export function createMultiSessionApp({ github }: { github: PullRequestSource })
         res.status(502).json({ error: GH_FAILURE_ERROR });
         return;
       }
-      console.error(`Failed to open a session for ${label}:`, error);
+      console.error(`Failed to open a session for ${label}: ${describeError(error)}`);
       res.status(500).json({ error: 'Failed to open the session' });
     }
   });

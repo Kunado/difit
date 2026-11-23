@@ -436,6 +436,29 @@ describe('POST /api/sessions', () => {
     expect(comments.threads.map((thread: { id: string }) => thread.id)).toEqual(['bot-1']);
     expect(consoleWarn.mock.calls.flat().join('\n')).toContain('octo/alpha#1');
   });
+
+  it('answers 500 when the session cannot be built, and masks tokens in the log', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const github = fakeGitHub();
+    // A review comment that throws when read stands in for any unexpected failure.
+    github.getPrCommentImports.mockResolvedValue([
+      {
+        get type(): never {
+          throw new Error('unexpected ghp_abcdefghijklmnopqrstuvwxyz0123456789');
+        },
+      } as unknown as CommentImport,
+    ]);
+    const { base } = await startApp(github);
+
+    const response = await createSession(base, { prUrl: PR_A });
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: 'Failed to open the session' });
+    const logged = consoleError.mock.calls.flat().join('\n');
+    expect(logged).toContain('Failed to open a session for octo/alpha#1: unexpected [redacted]');
+    expect(logged).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz0123456789');
+    expect(await listSessions(base)).toEqual([]);
+  });
 });
 
 describe('a gh run that never exits', () => {
