@@ -100,6 +100,8 @@ For Enterprise Server PRs, authenticate GitHub CLI against your Enterprise host:
 1. `gh auth login --hostname YOUR-ENTERPRISE-SERVER`
 2. Or set `GH_HOST=YOUR-ENTERPRISE-SERVER` with `GH_TOKEN`/`GITHUB_TOKEN`
 
+The running difit server reviews github.com PRs only, so add `--standalone` for an Enterprise Server PR: `difit --pr <url> --standalone`.
+
 ### Multi-PR Server
 
 `difit serve` starts a resident server that holds one review per GitHub PR, each at its own `/s/<id>/` page, with the list of open PRs at `/`. Closing a browser tab does not stop it.
