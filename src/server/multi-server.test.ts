@@ -160,7 +160,9 @@ async function openEventStream(url: string): Promise<EventStream> {
       let end = buffer.indexOf('\n\n');
       while (end !== -1) {
         const data = buffer.slice('data: '.length, end);
-        events.push(data.startsWith('{') ? JSON.parse(data) : { type: data });
+        // Watch events are JSON; heartbeat events are bare words.
+        const { type, version } = data.startsWith('{') ? JSON.parse(data) : { type: data };
+        events.push(version === undefined ? { type } : { type, version });
         buffer = buffer.slice(end + 2);
         end = buffer.indexOf('\n\n');
       }
@@ -238,7 +240,7 @@ describe('POST /api/sessions', () => {
       createSession(base, { prUrl: PR_A }),
     ]);
 
-    expect(responses.map((response) => response.status).sort()).toEqual([200, 201]);
+    expect(responses.map((response) => response.status).sort((x, y) => x - y)).toEqual([200, 201]);
     const [a, b] = await Promise.all(responses.map((response) => response.json()));
     expect(a).toEqual(b);
     expect(await listSessions(base)).toHaveLength(1);
