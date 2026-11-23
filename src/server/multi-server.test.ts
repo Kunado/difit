@@ -57,6 +57,7 @@ afterEach(async () => {
         }),
     ),
   );
+  vi.clearAllMocks();
   vi.restoreAllMocks();
 });
 
