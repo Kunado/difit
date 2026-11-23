@@ -127,7 +127,10 @@ function createCommentSessionKey(selection: DiffSelection): string {
 type ReviewSessionOptions = Omit<
   ServerOptions,
   'preferredPort' | 'host' | 'openBrowser' | 'keepAlive'
->;
+> & {
+  // Browser storage key; defaults to a hash of the repository path.
+  repositoryId?: string;
+};
 
 interface ReviewSessionHooks {
   onHeartbeatClose(session: ReviewSession): void;
@@ -138,6 +141,8 @@ export interface ReviewSession {
   readonly isEmpty: boolean;
   startWatching(): Promise<void>;
   outputFinalComments(): void;
+  // Same effect as POST /api/comment-imports for the current selection.
+  importComments(commentImports: CommentImport[]): void;
   dispose(): Promise<void>;
 }
 
@@ -148,7 +153,8 @@ export async function createReviewSession(
   // Keeps the name `app` so the route registrations below match upstream line for line.
   const app = express.Router();
   const repositoryPath = resolve(options.repoPath ?? process.cwd());
-  const repositoryId = createHash('sha256').update(repositoryPath).digest('hex');
+  const repositoryId =
+    options.repositoryId ?? createHash('sha256').update(repositoryPath).digest('hex');
   const initialCommentImports = options.commentImports || [];
   const initialSelection = options.selection ?? createDiffSelection('', '');
   const commentImportId =
@@ -844,6 +850,11 @@ export async function createReviewSession(
       }
     },
     outputFinalComments,
+    importComments: (commentImports) => {
+      const session = getOrCreateCommentSession(currentCommentSelection);
+      const merged = mergeCommentImports(session.threads, commentImports);
+      updateCommentSession(currentCommentSelection, merged.threads);
+    },
     dispose: async () => {
       disposed = true;
       for (const closeStream of streamClosers) {
@@ -956,7 +967,7 @@ export async function startServer(
   return { port, url, isEmpty: session.isEmpty, server };
 }
 
-async function startServerWithFallback(
+export async function startServerWithFallback(
   app: Express,
   preferredPort: number,
   host: string,
