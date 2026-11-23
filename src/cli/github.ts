@@ -9,10 +9,20 @@ const execFileAsync = promisify(execFile);
 // patch of a large PR; 64 MiB covers any diff GitHub serves while staying bounded.
 const MAX_GH_OUTPUT_BYTES = 64 * 1024 * 1024;
 
+// A gh that stalls (a dead connection, a prompt nobody answers) would otherwise keep its
+// caller waiting forever; the multi-session server would hold the PR as "being created".
+// gh normally answers in seconds. 90 seconds leaves room for a slow GitHub and still
+// answers well before Node's fetch stops waiting for response headers (300 seconds).
+const GH_TIMEOUT_MS = 90_000;
+
 async function runGh(args: string[]): Promise<string> {
   const { stdout } = await execFileAsync('gh', args, {
     encoding: 'utf8',
     maxBuffer: MAX_GH_OUTPUT_BYTES,
+    timeout: GH_TIMEOUT_MS,
+    // execFile settles only once gh exits, and a process can ignore SIGTERM but not
+    // SIGKILL. gh only reads here, so there is nothing to shut down cleanly.
+    killSignal: 'SIGKILL',
   });
   return stdout;
 }
@@ -128,6 +138,10 @@ function isPositiveInteger(value: unknown): value is number {
 }
 
 function formatGhCommandError(error: unknown): Error {
+  // execFile sets `killed` when it stopped gh itself, which only the timeout does here.
+  if (typeof error === 'object' && error !== null && 'killed' in error && error.killed === true) {
+    return new Error(`gh timed out after ${GH_TIMEOUT_MS / 1000} seconds and was killed`);
+  }
   const stderr = (error as { stderr?: Buffer | string }).stderr;
   const stderrText =
     typeof stderr === 'string'
