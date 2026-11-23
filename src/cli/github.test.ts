@@ -1,6 +1,40 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { parseGitHubPrUrl, parsePrCommentImportsResponse } from './github';
+import {
+  getPrCommentImports,
+  getPrPatch,
+  getPrTitle,
+  parseGitHubPrUrl,
+  parsePrCommentImportsResponse,
+} from './github';
+
+const { ghMock } = vi.hoisted(() => ({ ghMock: vi.fn() }));
+
+// Every gh run resolves through ghMock, whether the code awaits a promisified
+// execFile or passes it a callback. Synchronous runs fail the test, so no test
+// reaches the real gh. Named imports of a built-in resolve through `default`,
+// so the mock replaces both.
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('child_process')>();
+  const { promisify } = await import('util');
+  const execFile = Object.assign(
+    (file: string, args: string[], options: object, callback: (...result: unknown[]) => void) => {
+      ghMock(file, args, options).then(
+        ({ stdout, stderr }: { stdout: string; stderr: string }) => callback(null, stdout, stderr),
+        (error: unknown) => callback(error, '', ''),
+      );
+    },
+    { [promisify.custom]: (...args: unknown[]) => ghMock(...args) },
+  );
+  const mocked = {
+    ...actual,
+    execFile,
+    execFileSync: () => {
+      throw new Error('gh must not run synchronously');
+    },
+  };
+  return { ...mocked, default: mocked };
+});
 
 function createReviewComment(overrides: Record<string, unknown> = {}) {
   return {
@@ -369,6 +403,119 @@ describe('CLI GitHub utils', () => {
       expect(parseGitHubPrUrl('https://github.com')).toBe(null);
       expect(parseGitHubPrUrl('https://github.com/owner')).toBe(null);
       expect(parseGitHubPrUrl('https://github.com/owner/repo/pull')).toBe(null);
+    });
+  });
+
+  describe('gh commands', () => {
+    const PR_URL = 'https://github.com/owner/repo/pull/123';
+    // Large PR patches exceed Node's 1 MiB default output buffer.
+    const MAX_GH_OUTPUT_BYTES = 64 * 1024 * 1024;
+
+    const reviewThreadsPage = (threadId: string, endCursor: string | null) => ({
+      stdout: JSON.stringify({
+        data: {
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                nodes: [
+                  createReviewThread({
+                    id: threadId,
+                    comments: { nodes: [createReviewComment({ id: `${threadId}_COMMENT` })] },
+                  }),
+                ],
+                pageInfo: { hasNextPage: endCursor !== null, endCursor },
+              },
+            },
+          },
+        },
+      }),
+      stderr: '',
+    });
+
+    afterEach(() => {
+      ghMock.mockReset();
+    });
+
+    it('runs gh pr diff without blocking, passing the URL after -- with a large buffer', async () => {
+      let finish: (output: { stdout: string; stderr: string }) => void = () => {};
+      ghMock.mockReturnValueOnce(
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+      );
+
+      const patch = getPrPatch(PR_URL);
+      let settled = false;
+      void patch.then(() => {
+        settled = true;
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+
+      finish({ stdout: 'diff --git a/x b/x\n', stderr: '' });
+      await expect(patch).resolves.toBe('diff --git a/x b/x\n');
+      expect(ghMock).toHaveBeenCalledWith(
+        'gh',
+        ['pr', 'diff', '--', PR_URL],
+        expect.objectContaining({ encoding: 'utf8', maxBuffer: MAX_GH_OUTPUT_BYTES }),
+      );
+    });
+
+    it('reports gh stderr with a login hint when gh pr diff fails', async () => {
+      ghMock.mockRejectedValueOnce(
+        Object.assign(new Error('Command failed: gh pr diff'), { stderr: 'HTTP 404: Not Found\n' }),
+      );
+
+      await expect(getPrPatch(PR_URL)).rejects.toThrow('HTTP 404: Not Found\nTry: gh auth login');
+    });
+
+    it('rejects an empty diff from gh pr diff', async () => {
+      ghMock.mockResolvedValueOnce({ stdout: '  \n', stderr: '' });
+
+      await expect(getPrPatch(PR_URL)).rejects.toThrow('No diff content returned from gh pr diff');
+    });
+
+    it('pages through review threads with gh api graphql', async () => {
+      ghMock
+        .mockResolvedValueOnce(reviewThreadsPage('THREAD_1', 'CURSOR_1'))
+        .mockResolvedValueOnce(reviewThreadsPage('THREAD_2', null));
+
+      const imports = await getPrCommentImports(PR_URL);
+
+      expect(imports.map((commentImport) => commentImport.id)).toEqual([
+        'THREAD_1_COMMENT',
+        'THREAD_2_COMMENT',
+      ]);
+      expect(ghMock).toHaveBeenCalledTimes(2);
+      const [[, firstArgs, options], [, secondArgs]] = ghMock.mock.calls;
+      expect(firstArgs.slice(0, 4)).toEqual(['api', 'graphql', '--hostname', 'github.com']);
+      expect(firstArgs).not.toContain('endCursor=CURSOR_1');
+      expect(secondArgs.slice(-2)).toEqual(['-F', 'endCursor=CURSOR_1']);
+      expect(options).toEqual(expect.objectContaining({ maxBuffer: MAX_GH_OUTPUT_BYTES }));
+    });
+
+    it('rejects invalid JSON from gh api graphql', async () => {
+      ghMock.mockResolvedValueOnce({ stdout: 'not json', stderr: '' });
+
+      await expect(getPrCommentImports(PR_URL)).rejects.toThrow(
+        'Invalid JSON returned from gh api graphql',
+      );
+    });
+
+    it('rejects a URL that is not a pull request without running gh', async () => {
+      await expect(getPrCommentImports('not-a-url')).rejects.toThrow('Invalid GitHub PR URL');
+      expect(ghMock).not.toHaveBeenCalled();
+    });
+
+    it('reads the PR title with gh pr view', async () => {
+      ghMock.mockResolvedValueOnce({ stdout: '{"title":"Add the sessions API"}\n', stderr: '' });
+
+      await expect(getPrTitle(PR_URL)).resolves.toBe('Add the sessions API');
+      expect(ghMock).toHaveBeenCalledWith(
+        'gh',
+        ['pr', 'view', '--json', 'title', '--', PR_URL],
+        expect.objectContaining({ encoding: 'utf8', maxBuffer: MAX_GH_OUTPUT_BYTES }),
+      );
     });
   });
 });
