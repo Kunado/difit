@@ -6,11 +6,8 @@ import type { DiffFile } from '../../types/diff';
 import { useDiffComments } from './useDiffComments';
 import { useViewedFiles } from './useViewedFiles';
 
-// The multi-session server reports every PR diff as stdin...stdin and gives each PR
-// session its own repositoryId (a sha256 of the PR URL). Two PRs open in one browser
-// share an origin, so only the repositoryId keeps their saved state apart.
-const PR_A = 'a'.repeat(64);
-const PR_B = 'b'.repeat(64);
+const PR_A_REPOSITORY_ID = 'a'.repeat(64);
+const PR_B_REPOSITORY_ID = 'b'.repeat(64);
 
 const sharedFile: DiffFile = {
   path: 'src/shared.ts',
@@ -34,24 +31,26 @@ afterEach(() => {
 
 describe('two PR sessions in one browser', () => {
   it('keep their comments apart', () => {
-    const prA = openComments(PR_A);
+    const prA = openComments(PR_A_REPOSITORY_ID);
     act(() => {
       prA.current.addComment({ filePath: sharedFile.path, body: 'on PR A', side: 'new', line: 1 });
     });
 
-    expect(openComments(PR_B).current.comments).toEqual([]);
-    expect(openComments(PR_A).current.comments.map((comment) => comment.body)).toEqual(['on PR A']);
+    expect(openComments(PR_B_REPOSITORY_ID).current.comments).toEqual([]);
+    expect(
+      openComments(PR_A_REPOSITORY_ID).current.comments.map((comment) => comment.body),
+    ).toEqual(['on PR A']);
   });
 
   it('keep their viewed files apart', async () => {
-    const prA = openViewedFiles(PR_A);
+    const prA = openViewedFiles(PR_A_REPOSITORY_ID);
     await act(async () => {
       await prA.current.toggleFileViewed(sharedFile.path, sharedFile);
     });
     expect(prA.current.viewedFiles.has(sharedFile.path)).toBe(true);
 
-    const prB = openViewedFiles(PR_B);
-    const prAReopened = openViewedFiles(PR_A);
+    const prB = openViewedFiles(PR_B_REPOSITORY_ID);
+    const prAReopened = openViewedFiles(PR_A_REPOSITORY_ID);
 
     await waitFor(() => expect(prAReopened.current.viewedFiles.has(sharedFile.path)).toBe(true));
     expect(prB.current.viewedFiles.has(sharedFile.path)).toBe(false);
