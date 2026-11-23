@@ -4,7 +4,7 @@ import { type Server } from 'http';
 import { join, dirname, isAbsolute, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
 
-import express, { type Express } from 'express';
+import express, { type Express, type Router } from 'express';
 import open from 'open';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -124,10 +124,29 @@ function createCommentSessionKey(selection: DiffSelection): string {
   return getDiffSelectionKey(selection);
 }
 
-export async function startServer(
-  options: ServerOptions,
-): Promise<{ port: number; url: string; isEmpty?: boolean; server?: Server }> {
-  const app = express();
+type ReviewSessionOptions = Omit<
+  ServerOptions,
+  'preferredPort' | 'host' | 'openBrowser' | 'keepAlive'
+>;
+
+interface ReviewSessionHooks {
+  onHeartbeatClose(session: ReviewSession): void;
+}
+
+export interface ReviewSession {
+  readonly router: Router;
+  readonly isEmpty: boolean;
+  startWatching(): Promise<void>;
+  outputFinalComments(): void;
+  dispose(): Promise<void>;
+}
+
+export async function createReviewSession(
+  options: ReviewSessionOptions,
+  hooks: ReviewSessionHooks,
+): Promise<ReviewSession> {
+  // Keeps the name `app` so the route registrations below match upstream line for line.
+  const app = express.Router();
   const repositoryPath = resolve(options.repoPath ?? process.cwd());
   const repositoryId = createHash('sha256').update(repositoryPath).digest('hex');
   const initialCommentImports = options.commentImports || [];
@@ -144,16 +163,6 @@ export async function startServer(
   >();
   const diffDataCache = new Map<string, DiffResponse>();
   const initialIgnoreWhitespace = options.ignoreWhitespace || false;
-
-  app.use(express.json());
-  app.use(express.text()); // For sendBeacon text/plain requests
-
-  app.use((_req, res, next) => {
-    res.header('Access-Control-Allow-Origin', 'http://localhost:*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-    next();
-  });
 
   // Skip validation if using stdin diff
   if (!options.stdinDiff) {
@@ -807,6 +816,29 @@ export async function startServer(
     // When client disconnects (tab closed, navigation, etc.)
     req.on('close', () => {
       clearInterval(heartbeatInterval);
+      hooks.onHeartbeatClose(handle);
+    });
+  });
+
+  const handle: ReviewSession = {
+    router: app,
+    isEmpty: initialDiffData.isEmpty || false,
+    startWatching: async () => {
+      if (options.diffMode) {
+        await fileWatcher.start(options.diffMode, repositoryPath, 300, invalidateCache);
+      }
+    },
+    outputFinalComments,
+    dispose: () => fileWatcher.stop(),
+  };
+  return handle;
+}
+
+export async function startServer(
+  options: ServerOptions,
+): Promise<{ port: number; url: string; isEmpty?: boolean; server?: Server }> {
+  const session = await createReviewSession(options, {
+    onHeartbeatClose: (closedSession) => {
       if (options.keepAlive) {
         console.log('Client disconnected, but server is staying alive (--keep-alive)');
         console.log('Press Ctrl+C to stop the server');
@@ -816,14 +848,27 @@ export async function startServer(
           console.log('Client disconnected, shutting down server...');
 
           // Stop file watcher
-          await fileWatcher.stop();
+          await closedSession.dispose();
 
-          outputFinalComments();
+          closedSession.outputFinalComments();
           process.exit(0);
         }, 100);
       }
-    });
+    },
   });
+  const app = express();
+
+  app.use(express.json());
+  app.use(express.text()); // For sendBeacon text/plain requests
+
+  app.use((_req, res, next) => {
+    res.header('Access-Control-Allow-Origin', 'http://localhost:*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    next();
+  });
+
+  app.use(session.router);
 
   // Always runs in production mode when distributed as a CLI tool
   const isProduction =
@@ -869,7 +914,7 @@ export async function startServer(
   // Start file watcher
   if (options.diffMode) {
     try {
-      await fileWatcher.start(options.diffMode, repositoryPath, 300, invalidateCache);
+      await session.startWatching();
     } catch (error) {
       console.warn('⚠️  File watcher failed to start:', error);
       console.warn('   Continuing without file watching...');
@@ -877,7 +922,7 @@ export async function startServer(
   }
 
   // Check if diff is empty and skip browser opening
-  if (initialDiffData.isEmpty) {
+  if (session.isEmpty) {
     // Don't open browser if no differences found
   } else if (options.openBrowser) {
     try {
@@ -887,7 +932,7 @@ export async function startServer(
     }
   }
 
-  return { port, url, isEmpty: initialDiffData.isEmpty || false, server };
+  return { port, url, isEmpty: session.isEmpty, server };
 }
 
 async function startServerWithFallback(
