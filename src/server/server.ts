@@ -141,6 +141,8 @@ export interface ReviewSession {
   readonly isEmpty: boolean;
   startWatching(): Promise<void>;
   outputFinalComments(): void;
+  // Same effect as POST /api/comment-imports for the current selection.
+  importComments(commentImports: CommentImport[]): void;
   dispose(): Promise<void>;
 }
 
@@ -833,6 +835,11 @@ export async function createReviewSession(
       }
     },
     outputFinalComments,
+    importComments: (commentImports) => {
+      const session = getOrCreateCommentSession(currentCommentSelection);
+      const merged = mergeCommentImports(session.threads, commentImports);
+      updateCommentSession(currentCommentSelection, merged.threads);
+    },
     dispose: () => fileWatcher.stop(),
   };
   return handle;
