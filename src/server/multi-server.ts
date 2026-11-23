@@ -129,10 +129,17 @@ function identifySession(pr: PullRequestRef): { id: string; repositoryId: string
 
 const labelOf = (pr: PullRequestRef) => `${pr.owner}/${pr.repo}#${pr.number}`;
 
+const maskTokens = (text: string) => text.replace(GITHUB_TOKEN_PATTERN, '[redacted]');
+
 // gh's messages help in the server log but could echo a token, so mask token shapes.
 function describeError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.replace(GITHUB_TOKEN_PATTERN, '[redacted]');
+  return maskTokens(error instanceof Error ? error.message : String(error));
+}
+
+// For an unexpected failure the stack locates the bug. It starts with the message, so it
+// gets the same mask.
+function describeErrorWithStack(error: unknown): string {
+  return error instanceof Error && error.stack ? maskTokens(error.stack) : describeError(error);
 }
 
 const toSessionInfo = (entry: SessionEntry) => ({
@@ -187,7 +194,7 @@ function handleError(error: unknown, _req: Request, res: Response, next: NextFun
       .json({ error: status === 413 ? 'Request body too large' : 'Invalid request body' });
     return;
   }
-  console.error(`Unexpected error in the multi-session server: ${describeError(error)}`);
+  console.error(`Unexpected error in the multi-session server: ${describeErrorWithStack(error)}`);
   res.status(500).json({ error: 'Internal server error' });
 }
 
@@ -309,7 +316,7 @@ export function createMultiSessionApp({ github }: { github: PullRequestSource })
         res.status(502).json({ error: GH_FAILURE_ERROR });
         return;
       }
-      console.error(`Failed to open a session for ${label}: ${describeError(error)}`);
+      console.error(`Failed to open a session for ${label}: ${describeErrorWithStack(error)}`);
       res.status(500).json({ error: 'Failed to open the session' });
     }
   });
