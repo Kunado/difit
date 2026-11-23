@@ -1000,6 +1000,29 @@ describe('review pages', () => {
     }
   });
 
+  it('serves the client from under a dot directory, as with npx in ~/.npm', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'difit-dot-'));
+    try {
+      const hiddenClientDir = join(parent, '.hidden-dir', 'client');
+      await mkdir(join(hiddenClientDir, 'assets'), { recursive: true });
+      await writeFile(join(hiddenClientDir, 'index.html'), INDEX_HTML);
+      await writeFile(join(hiddenClientDir, 'assets', 'index.js'), 'export {};');
+      const { base } = await startApp(fakeGitHub(), { clientDir: hiddenClientDir });
+      const { id, url } = await openPr(base, PR_A);
+
+      for (const path of [`/s/${id}`, url]) {
+        const response = await fetch(`${base}${path}`);
+        expect(response.status).toBe(200);
+        expect(await response.text()).toBe(INDEX_HTML);
+      }
+      const asset = await fetch(`${base}/assets/index.js`);
+      expect(asset.status).toBe(200);
+      expect(await asset.text()).toBe('export {};');
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
   it('serves the client assets from the root, where the page refers to them', async () => {
     const { base } = await startApp(fakeGitHub(), { clientDir });
 
