@@ -44,17 +44,25 @@ export function ignoreStdioErrorsForBackgroundDaemon(): void {
 }
 
 export async function startBackgroundProcess(spawnProcess: typeof spawn = spawn): Promise<void> {
-  const scriptPath = process.argv[1];
-  if (!scriptPath) {
-    throw new Error('Unable to determine difit entrypoint for background process');
-  }
-
   const childArgs = process.argv.slice(2).filter((arg) => arg !== '--background');
   if (!childArgs.includes('--keep-alive')) {
     childArgs.push('--keep-alive');
   }
   if (!childArgs.includes('--no-open')) {
     childArgs.push('--no-open');
+  }
+
+  console.log(JSON.stringify(await spawnBackgroundChild(childArgs, spawnProcess)));
+}
+
+/** Runs difit with childArgs detached and resolves with the handshake it sends once ready. */
+export async function spawnBackgroundChild(
+  childArgs: string[],
+  spawnProcess: typeof spawn = spawn,
+): Promise<BackgroundServerInfo> {
+  const scriptPath = process.argv[1];
+  if (!scriptPath) {
+    throw new Error('Unable to determine difit entrypoint for background process');
   }
 
   const child = spawnProcess(process.execPath, [scriptPath, ...childArgs], {
@@ -68,7 +76,7 @@ export async function startBackgroundProcess(spawnProcess: typeof spawn = spawn)
 
   child.stderr?.setEncoding('utf8');
 
-  await new Promise<void>((resolve, reject) => {
+  return await new Promise<BackgroundServerInfo>((resolve, reject) => {
     let settled = false;
     let stderr = '';
 
@@ -100,9 +108,8 @@ export async function startBackgroundProcess(spawnProcess: typeof spawn = spawn)
       }
 
       finish(() => {
-        console.log(JSON.stringify(handshake));
         releaseBackgroundChild(child);
-        resolve();
+        resolve(handshake);
       });
     };
 
