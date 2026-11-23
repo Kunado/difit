@@ -142,7 +142,8 @@ export class FileWatcherService {
               relevantEvents.push(event);
             }
 
-            if (relevantEvents.length > 0) {
+            // stop() may have run during the .gitignore checks above.
+            if (relevantEvents.length > 0 && generation === this.generation) {
               this.debouncedBroadcast();
             }
           },
