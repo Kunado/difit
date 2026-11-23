@@ -1,9 +1,28 @@
 import { rmSync } from 'fs';
-import { defineConfig } from 'vite';
+import { defineConfig, type ProxyOptions } from 'vite';
 import react from '@vitejs/plugin-react';
 import { resolve } from 'path';
 
+import { originForApiServer } from './dev/dev-proxy.js';
+
 const apiTarget = process.env.VITE_DIFIT_API_URL || 'http://localhost:4966';
+
+const apiProxy: ProxyOptions = {
+  target: apiTarget,
+  changeOrigin: true,
+  configure: (proxy) => {
+    proxy.on('proxyReq', (proxyReq, req) => {
+      const origin = originForApiServer({
+        origin: req.headers.origin,
+        host: req.headers.host,
+        target: apiTarget,
+      });
+      if (origin !== undefined) {
+        proxyReq.setHeader('origin', origin);
+      }
+    });
+  },
+};
 
 export default defineConfig({
   plugins: [
@@ -33,14 +52,8 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': {
-        target: apiTarget,
-        changeOrigin: true,
-      },
-      '^/s/[0-9a-f]{16}/api/': {
-        target: apiTarget,
-        changeOrigin: true,
-      },
+      '/api': apiProxy,
+      '^/s/[0-9a-f]{16}/api/': apiProxy,
     },
   },
 });
