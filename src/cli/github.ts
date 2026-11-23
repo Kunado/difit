@@ -1,6 +1,31 @@
-import { execFileSync } from 'child_process';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 
 import type { CommentImport, DiffCommentPosition, DiffLineRange } from '../types/diff.js';
+
+const execFileAsync = promisify(execFile);
+
+// gh hands back its whole output at once. Node's default cap (1 MiB) cuts off the
+// patch of a large PR; 64 MiB covers any diff GitHub serves while staying bounded.
+const MAX_GH_OUTPUT_BYTES = 64 * 1024 * 1024;
+
+// A gh that stalls (a dead connection, a prompt nobody answers) would otherwise keep its
+// caller waiting forever; the multi-session server would hold the PR as "being created".
+// gh normally answers in seconds. 90 seconds leaves room for a slow GitHub and still
+// answers well before Node's fetch stops waiting for response headers (300 seconds).
+const GH_TIMEOUT_MS = 90_000;
+
+async function runGh(args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync('gh', args, {
+    encoding: 'utf8',
+    maxBuffer: MAX_GH_OUTPUT_BYTES,
+    timeout: GH_TIMEOUT_MS,
+    // execFile settles only once gh exits, and a process can ignore SIGTERM but not
+    // SIGKILL. gh only reads here, so there is nothing to shut down cleanly.
+    killSignal: 'SIGKILL',
+  });
+  return stdout;
+}
 
 interface PullRequestInfo {
   owner: string;
@@ -113,6 +138,10 @@ function isPositiveInteger(value: unknown): value is number {
 }
 
 function formatGhCommandError(error: unknown): Error {
+  // execFile sets `killed` when it stopped gh itself, which only the timeout does here.
+  if (typeof error === 'object' && error !== null && 'killed' in error && error.killed === true) {
+    return new Error(`gh timed out after ${GH_TIMEOUT_MS / 1000} seconds and was killed`);
+  }
   const stderr = (error as { stderr?: Buffer | string }).stderr;
   const stderrText =
     typeof stderr === 'string'
@@ -326,12 +355,10 @@ export function parseGitHubPrUrl(url: string): PullRequestInfo | null {
   }
 }
 
-export function getPrPatch(prArg: string): string {
+export async function getPrPatch(prArg: string): Promise<string> {
   try {
-    const patch = execFileSync('gh', ['pr', 'diff', prArg], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    // `--` keeps an argument that starts with `-` from being read as an option.
+    const patch = await runGh(['pr', 'diff', '--', prArg]);
 
     if (!patch.trim()) {
       throw new Error('No diff content returned from gh pr diff');
@@ -339,6 +366,19 @@ export function getPrPatch(prArg: string): string {
 
     return patch;
   } catch (error) {
+    throw formatGhCommandError(error);
+  }
+}
+
+export async function getPrTitle(prArg: string): Promise<string | undefined> {
+  try {
+    const output = await runGh(['pr', 'view', '--json', 'title', '--', prArg]);
+    const { title } = JSON.parse(output) as { title?: unknown };
+    return typeof title === 'string' ? title : undefined;
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new Error('Invalid JSON returned from gh pr view');
+    }
     throw formatGhCommandError(error);
   }
 }
@@ -373,7 +413,7 @@ export function parsePrCommentImportsResponse(
   };
 }
 
-export function getPrCommentImports(prArg: string): Promise<CommentImport[]> {
+export async function getPrCommentImports(prArg: string): Promise<CommentImport[]> {
   const pullRequestInfo = parseGitHubPrUrl(prArg);
   if (!pullRequestInfo) {
     throw new Error('Invalid GitHub PR URL');
@@ -404,16 +444,13 @@ export function getPrCommentImports(prArg: string): Promise<CommentImport[]> {
         args.push('-F', `endCursor=${endCursor}`);
       }
 
-      const stdout = execFileSync('gh', args, {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      const stdout = await runGh(args);
       const parsed = JSON.parse(stdout) as GitHubReviewThreadsGraphqlResponse;
       const page = parsePrCommentImportsResponse(parsed);
       commentImports.push(...page.commentImports);
 
       if (!page.pageInfo.hasNextPage) {
-        return Promise.resolve(commentImports);
+        return commentImports;
       }
 
       if (!page.pageInfo.endCursor) {
