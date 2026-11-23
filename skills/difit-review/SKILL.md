@@ -50,6 +50,7 @@ The detailed procedure is as follows.
   - Use `<difit-command> <target> [compare-with]` to specify the target diff.
   - For uncommitted changes use `<difit-command> .`, for working tree changes use `<difit-command> working`, and for staged changes use `<difit-command> staged`.
   - For stdin input, use a form such as `diff -u file1.txt file2.txt | <difit-command>`.
+  - For a GitHub PR, `<difit-command> --pr <url>` adds it to the shared difit server (started in the background if none runs) at its own `/s/<id>/` page; reopening the same PR reuses that page. For later rounds use `comment add|get|resolve --pr <url>` instead of `--port`. The server holds other PRs too: never kill its pid (with `--background`, the JSON's `pid` is the shared server's); `<difit-command> stop` stops it for every PR. To get a server of its own with the `--port` flow above, add `--standalone`.
 - **Comment arguments**
   - Use `type: "thread"` for each comment.
   - Write comment bodies in the language the user is using.
