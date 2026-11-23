@@ -642,6 +642,10 @@ describe('GET /api/sessions', () => {
 });
 
 describe('DELETE /api/sessions/:id', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('drops the session and ends its event streams, leaving other sessions open', async () => {
     const { base } = await startApp();
     const a = await openPr(base, PR_A);
@@ -679,6 +683,28 @@ describe('DELETE /api/sessions/:id', () => {
         { type: 'commentsChanged', version: 1 },
       ]),
     );
+  });
+
+  it('ends its event streams cleanly and leaves no heartbeat timer behind', async () => {
+    const { base } = await startApp();
+    const a = await openPr(base, PR_A);
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    const watch = await openEventStream(`${base}${a.url}api/watch`);
+    const heartbeat = await openEventStream(`${base}${a.url}api/heartbeat`);
+    await vi.waitFor(() => {
+      expect(watch.events).toEqual([{ type: 'connected' }]);
+      expect(heartbeat.events).toEqual([{ type: 'connected' }]);
+    });
+    expect(vi.getTimerCount()).toBe(1);
+
+    const response = await deleteSession(base, a.id);
+
+    expect(response.status).toBe(200);
+    // `ended` rejects if the connection breaks, so `true` means the server ended the stream.
+    expect(await settledWithin(watch.ended, 2000)).toBe(true);
+    expect(await settledWithin(heartbeat.ended, 2000)).toBe(true);
+    // A timer left running would write to the ended heartbeat response.
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('answers 404 for unknown session ids', async () => {
