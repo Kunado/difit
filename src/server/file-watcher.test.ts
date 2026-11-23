@@ -1,7 +1,8 @@
 import type { Event } from '@parcel/watcher';
 import { type Response } from 'express';
 import { resolve } from 'path';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SimpleGit } from 'simple-git';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { DiffMode } from '../types/watch.js';
 
@@ -133,6 +134,10 @@ describe('FileWatcherService', () => {
   });
 
   describe('after stop()', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
     it('releases a subscription that resolves after stop()', async () => {
       const subscribed = deferred<typeof mockSubscription>();
       vi.mocked(subscribe).mockReturnValueOnce(subscribed.promise);
@@ -155,6 +160,34 @@ describe('FileWatcherService', () => {
       expect(mockSubscription.unsubscribe).toHaveBeenCalledTimes(
         vi.mocked(subscribe).mock.calls.length,
       );
+    });
+
+    it('schedules no reload for an event whose .gitignore check outlasts stop()', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      const slowIgnoreCheck = deferred<string[]>();
+      vi.mocked(simpleGit).mockReturnValueOnce({
+        checkIgnore: vi.fn().mockResolvedValueOnce([]).mockReturnValueOnce(slowIgnoreCheck.promise),
+      } as unknown as SimpleGit);
+      const onCacheInvalidate = vi.fn();
+      await fileWatcher.start(DiffMode.WORKING, TEST_REPO_PATH, 300, onCacheInvalidate);
+      const subscribeCall = vi.mocked(subscribe).mock.calls[0];
+      const workingTreeCallback = subscribeCall[1];
+      const events: Event[] = [{ path: `${TEST_REPO_PATH}/a.txt`, type: 'update' }];
+
+      // Without stop(), the event schedules a reload.
+      await workingTreeCallback(null, events);
+      expect(vi.getTimerCount()).toBe(1);
+      vi.runAllTimers();
+      expect(onCacheInvalidate).toHaveBeenCalledTimes(1);
+
+      const handling = workingTreeCallback(null, events);
+      await fileWatcher.stop();
+      slowIgnoreCheck.resolve([]);
+      await handling;
+
+      expect(vi.getTimerCount()).toBe(0);
+      vi.runAllTimers();
+      expect(onCacheInvalidate).toHaveBeenCalledTimes(1);
     });
   });
 
