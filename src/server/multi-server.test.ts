@@ -1,12 +1,16 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
 import { request as httpRequest, type Server } from 'http';
 import { type AddressInfo } from 'net';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 import { fetch } from 'undici';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import pkg from '../../package.json' with { type: 'json' };
 import { getPrCommentImports, getPrPatch, getPrTitle } from '../cli/github.js';
 import { type CommentImport } from '../types/diff.js';
+import { SESSION_PATH_PATTERN } from '../utils/sessionPath.js';
 
 import { createMultiSessionApp, type PullRequestSource, startMultiServer } from './multi-server.js';
 
@@ -106,8 +110,11 @@ function holdPatch(github: ReturnType<typeof fakeGitHub>) {
   return () => release();
 }
 
-async function startApp(github: PullRequestSource = fakeGitHub()) {
-  const app = createMultiSessionApp({ github });
+async function startApp(
+  github: PullRequestSource = fakeGitHub(),
+  options: { clientDir?: string } = {},
+) {
+  const app = createMultiSessionApp({ github, ...options });
   const server = app.listen(0, '127.0.0.1');
   openServers.push(server);
   await new Promise<void>((resolve) => server.once('listening', () => resolve()));
@@ -961,6 +968,90 @@ describe('request guards', () => {
       },
     });
     expect(preflight.headers['access-control-allow-origin']).toBeUndefined();
+  });
+});
+
+describe('review pages', () => {
+  const INDEX_HTML =
+    '<!doctype html><div id="root"></div><script type="module" src="/assets/index.js"></script>';
+  let clientDir = '';
+
+  beforeEach(async () => {
+    clientDir = await mkdtemp(join(tmpdir(), 'difit-client-'));
+    await mkdir(join(clientDir, 'assets'));
+    await writeFile(join(clientDir, 'index.html'), INDEX_HTML);
+    await writeFile(join(clientDir, 'assets', 'index.js'), 'export {};');
+  });
+
+  afterEach(async () => {
+    await rm(clientDir, { recursive: true, force: true });
+  });
+
+  it('serves the client page at /s/<id> and /s/<id>/', async () => {
+    const { base } = await startApp(fakeGitHub(), { clientDir });
+    const { id, url } = await openPr(base, PR_A);
+    expect(url).toMatch(SESSION_PATH_PATTERN);
+
+    for (const path of [`/s/${id}`, url]) {
+      const response = await fetch(`${base}${path}`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toMatch(/^text\/html/);
+      expect(await response.text()).toBe(INDEX_HTML);
+    }
+  });
+
+  it('serves the client from under a dot directory, as with npx in ~/.npm', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'difit-dot-'));
+    try {
+      const hiddenClientDir = join(parent, '.hidden-dir', 'client');
+      await mkdir(join(hiddenClientDir, 'assets'), { recursive: true });
+      await writeFile(join(hiddenClientDir, 'index.html'), INDEX_HTML);
+      await writeFile(join(hiddenClientDir, 'assets', 'index.js'), 'export {};');
+      const { base } = await startApp(fakeGitHub(), { clientDir: hiddenClientDir });
+      const { id, url } = await openPr(base, PR_A);
+
+      for (const path of [`/s/${id}`, url]) {
+        const response = await fetch(`${base}${path}`);
+        expect(response.status).toBe(200);
+        expect(await response.text()).toBe(INDEX_HTML);
+      }
+      const asset = await fetch(`${base}/assets/index.js`);
+      expect(asset.status).toBe(200);
+      expect(await asset.text()).toBe('export {};');
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it('serves the client assets from the root, where the page refers to them', async () => {
+    const { base } = await startApp(fakeGitHub(), { clientDir });
+
+    const response = await fetch(`${base}/assets/index.js`);
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('export {};');
+  });
+
+  it('serves no page for an unknown session', async () => {
+    const { base } = await startApp(fakeGitHub(), { clientDir });
+
+    const response = await fetch(`${base}/s/0123456789abcdef/`);
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: 'Unknown session' });
+  });
+
+  it('answers 500 with JSON when the client is not built', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await rm(join(clientDir, 'index.html'));
+    const { base } = await startApp(fakeGitHub(), { clientDir });
+    const { url } = await openPr(base, PR_A);
+
+    const response = await fetch(`${base}${url}`);
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: expect.any(String) });
+    expect(errors).toHaveBeenCalledWith(expect.stringContaining('index.html'));
   });
 });
 
