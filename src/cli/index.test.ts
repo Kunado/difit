@@ -329,7 +329,7 @@ describe('CLI index.ts', () => {
           }
 
           await startServer({
-            stdinDiff: getPrPatch(options.pr),
+            stdinDiff: await getPrPatch(options.pr),
             contextLines: options.context,
           });
         });
@@ -398,7 +398,7 @@ describe('CLI index.ts', () => {
           }
 
           await startServer({
-            stdinDiff: getPrPatch(options.pr),
+            stdinDiff: await getPrPatch(options.pr),
           });
         });
 
@@ -701,7 +701,7 @@ describe('CLI index.ts', () => {
           updatedAt: '2026-03-25T09:12:00Z',
         },
       ];
-      mockGetPrPatch.mockReturnValue(prPatch);
+      mockGetPrPatch.mockResolvedValue(prPatch);
       mockGetPrCommentImports.mockResolvedValue(prCommentImports);
 
       const program = new Command();
@@ -734,7 +734,7 @@ describe('CLI index.ts', () => {
           }
 
           await startServer({
-            stdinDiff: getPrPatch(options.pr),
+            stdinDiff: await getPrPatch(options.pr),
             preferredPort: options.port,
             host: options.host,
             openBrowser: options.open,
@@ -779,7 +779,7 @@ describe('CLI index.ts', () => {
     it('continues with patch only when PR comment import fetch fails', async () => {
       const prUrl = 'https://github.com/owner/repo/pull/123';
       const prPatch = 'diff --git a/file.ts b/file.ts\nindex 1111111..2222222 100644\n';
-      mockGetPrPatch.mockReturnValue(prPatch);
+      mockGetPrPatch.mockResolvedValue(prPatch);
       mockGetPrCommentImports.mockRejectedValue(new Error('gh api graphql failed'));
 
       const program = new Command();
@@ -818,7 +818,7 @@ describe('CLI index.ts', () => {
           }
 
           await startServer({
-            stdinDiff: getPrPatch(options.pr),
+            stdinDiff: await getPrPatch(options.pr),
             preferredPort: options.port,
             host: options.host,
             openBrowser: options.open,
