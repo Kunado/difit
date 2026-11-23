@@ -530,8 +530,8 @@ describe('a gh run that never exits', () => {
 
     elapseTimeout();
 
-    expect((await deleteSession(base, id)).status).toBe(404);
     const response = await creation;
+    expect((await deleteSession(base, id)).status).toBe(404);
     expect(response.status).toBe(502);
     expect(await response.json()).toEqual({
       error:
