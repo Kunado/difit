@@ -127,6 +127,12 @@ function identifySession(pr: PullRequestRef): { id: string; repositoryId: string
   return { id: digest.slice(0, SESSION_ID_LENGTH), repositoryId: digest };
 }
 
+/** The /s/<id>/ id the server gives a PR, or null when prUrl is not a PR URL it accepts. */
+export function sessionIdForPullRequest(prUrl: string): string | null {
+  const pr = parsePullRequestUrl(prUrl);
+  return pr ? identifySession(pr).id : null;
+}
+
 const labelOf = (pr: PullRequestRef) => `${pr.owner}/${pr.repo}#${pr.number}`;
 
 const maskTokens = (text: string) => text.replace(GITHUB_TOKEN_PATTERN, '[redacted]');
@@ -398,9 +404,15 @@ export async function startMultiServer(options: {
       `The multi-session server only listens on loopback (localhost or 127.0.0.1), not ${host}`,
     );
   }
-  return await startServerWithFallback(
+  const { server } = await startServerWithFallback(
     createMultiSessionApp(options),
     options.preferredPort ?? 4966,
     host,
   );
+  // startServerWithFallback reports the port it asked for; with 0 the OS picks another.
+  const address = server.address();
+  if (typeof address !== 'object' || address === null) {
+    throw new Error('The multi-session server is not listening on a TCP port');
+  }
+  return { port: address.port, url: `http://${host}:${address.port}`, server };
 }

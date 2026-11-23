@@ -80,7 +80,10 @@ difit working  # Unstaged changes only
 
 ```bash
 difit --pr https://github.com/owner/repo/pull/123
+difit --pr https://github.com/owner/repo/pull/456  # added to the same server
 ```
+
+`--pr` adds the PR to the running difit server (see [Multi-PR Server](#multi-pr-server)) and opens its page. When no server is running, difit starts one in the background first, so each further `--pr` lands in the same server and port. `--comment` and `--clean` apply to the PR being added. To review a PR in a server of its own, as before, add `--standalone`.
 
 `--pr` mode fetches patches by running `gh pr diff --patch` under the hood.
 It also imports unresolved inline review threads from the PR so they appear as startup comments in difit.
@@ -96,6 +99,31 @@ For Enterprise Server PRs, authenticate GitHub CLI against your Enterprise host:
 
 1. `gh auth login --hostname YOUR-ENTERPRISE-SERVER`
 2. Or set `GH_HOST=YOUR-ENTERPRISE-SERVER` with `GH_TOKEN`/`GITHUB_TOKEN`
+
+### Multi-PR Server
+
+`difit serve` starts a resident server that holds one review per GitHub PR, each at its own `/s/<id>/` page, with the list of open PRs at `/`. Closing a browser tab does not stop it.
+
+```bash
+difit serve                # start it in the foreground (Ctrl+C stops it)
+difit serve --background   # start it detached; prints {"port","url","pid"} once it is ready
+difit stop                 # stop it
+```
+
+`serve` accepts `--port` (default 4966, +1 while occupied), `--host` (`localhost` or `127.0.0.1` only, because it runs `gh` with your credentials), and `--no-open`. It records where it runs in `~/.difit/server.json` (or `$DIFIT_CONFIG_DIR/server.json`); only one server runs at a time. `difit stop` signals the server only after it confirms, through `/api/server-info`, that the recorded process is that difit server, and it removes a stale file without signalling anything. Comments live in the server's memory, so stopping it drops them (the browser keeps its own copy).
+
+Tools can add a PR without the CLI by sending `POST /api/sessions` with `{"prUrl": "...", "commentImports": [...], "clean": false}`; the response holds the page's `url`.
+
+### Comments on a Running Server
+
+`difit comment` adds, reads, and resolves comments on a running server. `--port` targets a single-review server; `--session <id>` or `--pr <url>` targets one PR on the multi-PR server, found through its state file (or on `--port` when given).
+
+```bash
+difit comment add --pr https://github.com/owner/repo/pull/123 '{"type":"thread","filePath":"src/example.ts","position":{"side":"new","line":10},"body":"Why?"}'
+difit comment get --session 0123456789abcdef --format json
+difit comment resolve <thread-id> --pr https://github.com/owner/repo/pull/123
+difit comment get --port 4966   # a single-review server
+```
 
 ### Initial Comments
 
@@ -141,21 +169,22 @@ Stdin mode is selected with intent-first rules:
 
 ## ⚙️ CLI Options
 
-| Flag                  | Default         | Description                                                                                             |
-| --------------------- | --------------- | ------------------------------------------------------------------------------------------------------- |
-| `<target>`            | HEAD            | Commit hash, tag, HEAD~n, branch, or special arguments                                                  |
-| `[compare-with]`      | -               | Optional second commit to compare with (shows diff between the two)                                     |
-| `--merge-base`        | false           | Resolve the base revision with `git merge-base` before diffing (Git revision mode only)                 |
-| `--pr <url>`          | -               | GitHub PR URL to review (e.g., https://github.com/owner/repo/pull/123)                                  |
-| `--comment <json>`    | -               | Inject initial comments (repeatable; accepts a JSON object or array)                                    |
-| `--port`              | 4966            | Preferred port; falls back to +1 if occupied                                                            |
-| `--host`              | 127.0.0.1       | Host address to bind server to (use 0.0.0.0 for external access)                                        |
-| `--no-open`           | false           | Don't automatically open browser                                                                        |
-| `--clean`             | false           | Clear all existing comments and viewed files on startup                                                 |
-| `--include-untracked` | false           | Automatically include untracked files in diff (only with `.` or `working`)                              |
-| `--keep-alive`        | false           | Keep server running after browser disconnects (stop manually with Ctrl+C)                               |
-| `--background`        | false           | Keep the server running in the background and output JSON connection info                               |
-| `--context <lines>`   | git default (3) | Limit surrounding context lines per change (`0` shows changes only; not available with `--pr` or stdin) |
+| Flag                  | Default         | Description                                                                                                  |
+| --------------------- | --------------- | ------------------------------------------------------------------------------------------------------------ |
+| `<target>`            | HEAD            | Commit hash, tag, HEAD~n, branch, or special arguments                                                       |
+| `[compare-with]`      | -               | Optional second commit to compare with (shows diff between the two)                                          |
+| `--merge-base`        | false           | Resolve the base revision with `git merge-base` before diffing (Git revision mode only)                      |
+| `--pr <url>`          | -               | GitHub PR URL to add to the running server, started if needed (e.g., https://github.com/owner/repo/pull/123) |
+| `--standalone`        | false           | With `--pr`, review in a server of its own instead of the running one                                        |
+| `--comment <json>`    | -               | Inject initial comments (repeatable; accepts a JSON object or array)                                         |
+| `--port`              | 4966            | Preferred port; falls back to +1 if occupied                                                                 |
+| `--host`              | 127.0.0.1       | Host address to bind server to (use 0.0.0.0 for external access)                                             |
+| `--no-open`           | false           | Don't automatically open browser                                                                             |
+| `--clean`             | false           | Clear all existing comments and viewed files on startup                                                      |
+| `--include-untracked` | false           | Automatically include untracked files in diff (only with `.` or `working`)                                   |
+| `--keep-alive`        | false           | Keep server running after browser disconnects (stop manually with Ctrl+C)                                    |
+| `--background`        | false           | Keep the server running in the background and output JSON connection info                                    |
+| `--context <lines>`   | git default (3) | Limit surrounding context lines per change (`0` shows changes only; not available with `--pr` or stdin)      |
 
 ## 💬 Comment System
 
@@ -259,6 +288,7 @@ pnpm run format
 ### Development Workflow
 
 - **`pnpm run dev`**: Starts both Vite dev server (with hot reload) and CLI server simultaneously
+- **`pnpm run dev serve`**: The same with the multi-PR server; add PRs with `node dist/cli/index.js --pr <url>` and open `http://localhost:5173/s/<id>/`
 - **`pnpm run start <target>`**: Builds everything and starts production server (for testing final build)
 - **Development mode**: Uses Vite's dev server for hot reload and fast development
 - **Production mode**: Serves built static files (used by npx and production builds)

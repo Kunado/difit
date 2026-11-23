@@ -19,10 +19,9 @@ describe('createCommentCommand', () => {
   describe('add subcommand', () => {
     const addCommand = command.commands.find((c) => c.name() === 'add')!;
 
-    it('requires --port option', () => {
-      const portOption = addCommand.options.find((o) => o.long === '--port');
-      expect(portOption).toBeDefined();
-      expect(portOption?.mandatory).toBe(true);
+    it('takes the server from --port, --session, or --pr', () => {
+      const longs = addCommand.options.map((o) => o.long);
+      expect(longs).toEqual(expect.arrayContaining(['--port', '--session', '--pr']));
     });
 
     it('accepts optional json argument', () => {
@@ -36,10 +35,9 @@ describe('createCommentCommand', () => {
   describe('get subcommand', () => {
     const getCommand = command.commands.find((c) => c.name() === 'get')!;
 
-    it('requires --port option', () => {
-      const portOption = getCommand.options.find((o) => o.long === '--port');
-      expect(portOption).toBeDefined();
-      expect(portOption?.mandatory).toBe(true);
+    it('takes the server from --port, --session, or --pr', () => {
+      const longs = getCommand.options.map((o) => o.long);
+      expect(longs).toEqual(expect.arrayContaining(['--port', '--session', '--pr']));
     });
 
     it('has --format option with choices', () => {
@@ -57,10 +55,9 @@ describe('createCommentCommand', () => {
       expect(resolveCommand.aliases()).toContain('remove');
     });
 
-    it('requires --port option', () => {
-      const portOption = resolveCommand.options.find((o) => o.long === '--port');
-      expect(portOption).toBeDefined();
-      expect(portOption?.mandatory).toBe(true);
+    it('takes the server from --port, --session, or --pr', () => {
+      const longs = resolveCommand.options.map((o) => o.long);
+      expect(longs).toEqual(expect.arrayContaining(['--port', '--session', '--pr']));
     });
 
     it('accepts variadic threadIds argument', () => {

@@ -21,6 +21,7 @@ import {
 } from './utils.js';
 import { createCommentCommand } from './comment.js';
 import { getPrPatch, getPrCommentImports } from './github.js';
+import { createServeCommand, createStopCommand, reviewOnServer } from './serve.js';
 import {
   BACKGROUND_CHILD_ENV,
   emitBackgroundHandshake,
@@ -84,6 +85,7 @@ interface CliOptions {
   open: boolean;
   comment: string[];
   pr?: string;
+  standalone?: boolean;
   clean?: boolean;
   includeUntracked?: boolean;
   keepAlive?: boolean;
@@ -100,6 +102,8 @@ program
   .version(pkg.version, '-v, --version', 'output the version number')
   .enablePositionalOptions()
   .addCommand(createCommentCommand())
+  .addCommand(createServeCommand())
+  .addCommand(createStopCommand())
   .argument(
     '[commit-ish]',
     'Git commit, tag, branch, HEAD~n reference, or "working"/"staged"/"."',
@@ -118,7 +122,11 @@ program
     (value: string, previous: string[]) => [...previous, value],
     [],
   )
-  .option('--pr <url>', 'GitHub PR URL to review (e.g., https://github.com/owner/repo/pull/123)')
+  .option(
+    '--pr <url>',
+    'GitHub PR URL to review on the running difit server, started if needed (e.g., https://github.com/owner/repo/pull/123)',
+  )
+  .option('--standalone', 'with --pr, review in a server of its own instead of the running one')
   .option('--clean', 'start with a clean slate by clearing all existing comments')
   .option('--include-untracked', 'automatically include untracked files in diff')
   .option('--keep-alive', 'keep server running even after browser disconnects')
@@ -132,6 +140,7 @@ program
     try {
       const isBackgroundChild = process.env[BACKGROUND_CHILD_ENV] === '1';
       const backgroundMode = options.background || isBackgroundChild;
+      const reviewsOnServer = options.pr !== undefined && !options.standalone;
       let stdinDiff: string | undefined;
       let stdinReviewLabel = 'diff from stdin';
       let manualCommentImports: CommentImport[] = [];
@@ -145,7 +154,8 @@ program
         process.exit(1);
       }
 
-      if (options.background && !isBackgroundChild) {
+      // The running server is already in the background; --background only changes the output.
+      if (options.background && !isBackgroundChild && !reviewsOnServer) {
         await startBackgroundProcess();
         return;
       }
@@ -179,6 +189,19 @@ program
         if (options.context !== undefined) {
           console.error('Error: --context option cannot be used with --pr');
           process.exit(1);
+        }
+
+        if (reviewsOnServer) {
+          // The server runs gh and adds the PR's review comments itself.
+          await reviewOnServer({
+            prUrl: options.pr,
+            commentImports: manualCommentImports,
+            clean: options.clean === true,
+            open: options.open,
+            json: backgroundMode,
+            listen: { port: options.port, host: options.host },
+          });
+          return;
         }
 
         try {
@@ -354,7 +377,8 @@ program
     }
   });
 
-void program.parseAsync();
+// Exported so tests can run this entry point and wait for the command to finish.
+export const cliCompletion = program.parseAsync();
 
 async function handleUntrackedFiles(git: SimpleGit, addAutomatically?: boolean): Promise<void> {
   const files = await findUntrackedFiles(git);
