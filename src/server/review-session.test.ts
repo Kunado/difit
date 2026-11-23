@@ -389,12 +389,13 @@ describe('ReviewSession.dispose', () => {
     expect(vi.getTimerCount()).toBe(1);
 
     await sessions.get('a')!.dispose();
+    // Checked before the request close events, which also stop the timer.
+    expect(vi.getTimerCount()).toBe(0);
 
     await vi.waitFor(() => {
       expect(heartbeat.ended).toBe(true);
       expect(watch.ended).toBe(true);
     });
-    expect(vi.getTimerCount()).toBe(0);
     vi.advanceTimersByTime(10_000);
     expect(heartbeat.text).toBe('data: connected\n\n');
     // dispose() closed the streams; no tab went away.
