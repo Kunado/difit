@@ -356,6 +356,16 @@ export async function getPrPatch(prArg: string): Promise<string> {
   }
 }
 
+export async function getPrTitle(prArg: string): Promise<string | undefined> {
+  try {
+    const output = await runGh(['pr', 'view', '--json', 'title', '--', prArg]);
+    const { title } = JSON.parse(output) as { title?: unknown };
+    return typeof title === 'string' ? title : undefined;
+  } catch (error) {
+    throw formatGhCommandError(error);
+  }
+}
+
 export function parsePrCommentImportsResponse(
   response: GitHubReviewThreadsGraphqlResponse,
 ): PrCommentImportsPage {
