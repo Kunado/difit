@@ -362,6 +362,9 @@ export async function getPrTitle(prArg: string): Promise<string | undefined> {
     const { title } = JSON.parse(output) as { title?: unknown };
     return typeof title === 'string' ? title : undefined;
   } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new Error('Invalid JSON returned from gh pr view');
+    }
     throw formatGhCommandError(error);
   }
 }

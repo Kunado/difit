@@ -517,5 +517,11 @@ describe('CLI GitHub utils', () => {
         expect.objectContaining({ encoding: 'utf8', maxBuffer: MAX_GH_OUTPUT_BYTES }),
       );
     });
+
+    it('rejects invalid JSON from gh pr view without a login hint', async () => {
+      ghMock.mockResolvedValueOnce({ stdout: 'not json', stderr: '' });
+
+      await expect(getPrTitle(PR_URL)).rejects.toThrow(/^Invalid JSON returned from gh pr view$/);
+    });
   });
 });
