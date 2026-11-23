@@ -1,5 +1,5 @@
 import { render, screen, waitFor } from '@testing-library/react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import type { DiffFile } from '../../types/diff';
 
@@ -33,6 +33,10 @@ describe('ImageDiffViewer', () => {
     (global.fetch as any).mockResolvedValue({
       blob: () => Promise.resolve({ size: 1024 }),
     });
+  });
+
+  afterEach(() => {
+    window.history.replaceState(null, '', '/');
   });
 
   describe('File status handling', () => {
@@ -142,6 +146,27 @@ describe('ImageDiffViewer', () => {
       const images = screen.getAllByRole('img');
       expect(images[0]).toHaveAttribute('src', '/api/blob/old-test.jpg?ref=HEAD~1');
       expect(images[1]).toHaveAttribute('src', '/api/blob/test.jpg?ref=HEAD');
+    });
+
+    it('loads images from the review session of a /s/<id>/ page', () => {
+      window.history.replaceState(null, '', '/s/0123456789abcdef/');
+      const file: DiffFile = {
+        path: 'test.jpg',
+        oldPath: 'old-test.jpg',
+        status: 'modified',
+        additions: 1,
+        deletions: 1,
+        chunks: [],
+      };
+
+      renderViewer(file);
+
+      const images = screen.getAllByRole('img');
+      expect(images[0]).toHaveAttribute(
+        'src',
+        '/s/0123456789abcdef/api/blob/old-test.jpg?ref=HEAD~1',
+      );
+      expect(images[1]).toHaveAttribute('src', '/s/0123456789abcdef/api/blob/test.jpg?ref=HEAD');
     });
 
     it('uses static blob URLs when available', () => {
