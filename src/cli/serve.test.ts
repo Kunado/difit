@@ -140,6 +140,14 @@ async function startOtherApp(): Promise<number> {
   return (server.address() as AddressInfo).port;
 }
 
+// Accepts requests and never answers, like a server whose event loop is stuck.
+async function startUnresponsiveApp(): Promise<number> {
+  const server = createServer(() => {});
+  otherServers.push(server);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return (server.address() as AddressInfo).port;
+}
+
 async function writeState(state: Partial<ServerState>): Promise<void> {
   await writeFile(
     statePath(),
@@ -240,9 +248,13 @@ afterEach(async () => {
     }
   }
   await Promise.all(
-    otherServers
-      .splice(0)
-      .map((server) => new Promise<void>((resolve) => server.close(() => resolve()))),
+    otherServers.splice(0).map(
+      (server) =>
+        new Promise<void>((resolve) => {
+          server.closeAllConnections();
+          server.close(() => resolve());
+        }),
+    ),
   );
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -291,6 +303,17 @@ describe('difit serve', () => {
     const { state } = await serve();
 
     expect(state.pid).toBe(process.pid);
+  });
+
+  it('keeps the state file of a live process whose port does not answer in time', async () => {
+    const port = await startUnresponsiveApp();
+    await writeState({ pid: process.pid, port });
+
+    const result = await runCli(['serve', '--port', '0', '--no-open']);
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/not answering/);
+    expect((await readState()).port).toBe(port);
   });
 
   it('replaces a state file whose port answers as another app', async () => {
@@ -356,6 +379,18 @@ describe('difit stop', () => {
     expect(result.code).toBe(0);
     expect(kills).toEqual([]);
     await expect(readFile(statePath(), 'utf8')).rejects.toThrow(/ENOENT/);
+  });
+
+  it('leaves a live process whose port does not answer in time alone', async () => {
+    const port = await startUnresponsiveApp();
+    await writeState({ pid: process.pid, port });
+
+    const result = await runCli(['stop']);
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/not answering/);
+    expect(kills).toEqual([]);
+    expect((await readState()).port).toBe(port);
   });
 
   it('says so when no server is running', async () => {
@@ -542,7 +577,8 @@ describe('difit comment', () => {
         res.end('[]');
       });
       otherServers.push(server);
-      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      // The CLI calls --port on localhost.
+      await new Promise<void>((resolve) => server.listen(0, 'localhost', resolve));
       port = (server.address() as AddressInfo).port;
     });
 
