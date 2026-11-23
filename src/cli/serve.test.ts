@@ -483,13 +483,47 @@ describe('difit --pr', () => {
     expect(fakes.open).not.toHaveBeenCalled();
   });
 
-  it('reports an invalid PR URL from the server', async () => {
-    await serve();
+  it('adds the pages, trailing slash, query, and fragment of one PR to one session', async () => {
+    const { base } = await serve();
+    const variants = [PR_A, `${PR_A}/`, `${PR_A}/files`, `${PR_A}/commits/`, `${PR_A}?x=1#y`];
 
+    const results = [];
+    for (const url of variants) {
+      results.push(await runCli(['--pr', url, '--no-open']));
+    }
+
+    const sessions = await listSessions(base);
+    expect(sessions).toEqual([expect.objectContaining({ prUrl: PR_A })]);
+    for (const result of results) {
+      expect(result.stderr).toBe('');
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain(`${base}${sessions[0]?.url}`);
+    }
+  });
+
+  it('rejects an invalid PR URL without starting a server', async () => {
     const result = await runCli(['--pr', 'https://example.com/not-a-pr', '--no-open']);
 
     expect(result.code).toBe(1);
-    expect(result.stderr).toMatch(/prUrl must be a URL/);
+    expect(result.stderr).toMatch(/--pr must be a URL like https:\/\/github\.com\//);
+    expect(fakes.spawnBackgroundChild).not.toHaveBeenCalled();
+    await expect(readFile(statePath(), 'utf8')).rejects.toThrow(/ENOENT/);
+  });
+
+  it('rejects a GitHub Enterprise PR without starting a server and points to --standalone', async () => {
+    const result = await runCli([
+      '--pr',
+      'https://ghe.example.internal/acme/widgets/pull/12',
+      '--no-open',
+      '--port',
+      '0',
+    ]);
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('ghe.example.internal');
+    expect(result.stderr).toContain('--standalone');
+    expect(fakes.spawnBackgroundChild).not.toHaveBeenCalled();
+    await expect(readFile(statePath(), 'utf8')).rejects.toThrow(/ENOENT/);
   });
 
   it('keeps the single-server --pr with --standalone', async () => {
@@ -563,6 +597,35 @@ describe('difit comment', () => {
 
     expect(get.code).toBe(0);
     expect(get.stdout).toContain('via pr url');
+  });
+
+  it('finds the session from the pages, trailing slash, query, and fragment of the PR', async () => {
+    await serveWithPr();
+
+    const add = await runCli([
+      'comment',
+      'add',
+      '--pr',
+      `${PR_A}/files`,
+      comment('t3', 'via page'),
+    ]);
+    const get = await runCli(['comment', 'get', '--pr', `${PR_A}/?x=1#y`, '--format', 'json']);
+
+    expect(add.code).toBe(0);
+    expect(get.code).toBe(0);
+    expect(get.stdout).toContain('via page');
+  });
+
+  it('rejects a GitHub Enterprise --pr and points to --standalone', async () => {
+    const result = await runCli([
+      'comment',
+      'get',
+      '--pr',
+      'https://ghe.example.internal/acme/widgets/pull/12',
+    ]);
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('--standalone');
   });
 
   describe('against a recording server', () => {

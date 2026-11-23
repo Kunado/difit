@@ -6,7 +6,11 @@ import { Command } from 'commander';
 import open from 'open';
 
 import pkg from '../../package.json' with { type: 'json' };
-import { type PullRequestSource, startMultiServer } from '../server/multi-server.js';
+import {
+  type PullRequestSource,
+  sessionIdForPullRequest,
+  startMultiServer,
+} from '../server/multi-server.js';
 import { type CommentImport } from '../types/diff.js';
 
 import {
@@ -34,6 +38,10 @@ interface ListenOptions {
 
 const STOP_TIMEOUT_MS = 10_000;
 const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
+// A PR as a browser shows it: https://<host>/<owner>/<repo>/pull/<number>, optionally
+// followed by a page under it (/files), a trailing slash, a query, or a fragment.
+const PR_PAGE_PATTERN = /^https:\/\/([^/?#]+)(\/[^/?#]+\/[^/?#]+\/pull\/[^/?#]+)(?:[/?#].*)?$/s;
+const PR_URL_ERROR = '--pr must be a URL like https://github.com/<owner>/<repo>/pull/<number>';
 
 const github: PullRequestSource = { getPrPatch, getPrCommentImports, getPrTitle };
 
@@ -43,6 +51,28 @@ const alreadyRunning = (state: ServerState) =>
   );
 
 const describeError = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/**
+ * Reduces a PR URL to the https://github.com/<owner>/<repo>/pull/<number> the running
+ * server accepts, so every form of one PR reaches one session. Throws for anything else.
+ */
+export function resolvePullRequestUrl(input: string): { url: string; sessionId: string } {
+  const [, host, path] = PR_PAGE_PATTERN.exec(input) ?? [];
+  if (host === undefined || path === undefined) {
+    throw new Error(PR_URL_ERROR);
+  }
+  if (host.toLowerCase() !== 'github.com') {
+    throw new Error(
+      `${host} is not github.com. The difit server reviews github.com PRs only; for GitHub Enterprise, use difit --pr <url> --standalone`,
+    );
+  }
+  const url = `https://github.com${path}`;
+  const sessionId = sessionIdForPullRequest(url);
+  if (sessionId === null) {
+    throw new Error(PR_URL_ERROR);
+  }
+  return { url, sessionId };
+}
 
 // The arguments a detached `difit serve` child gets.
 function serveArgs({ port, host }: ListenOptions): string[] {
@@ -248,13 +278,15 @@ export async function reviewOnServer(options: {
   json: boolean;
   listen: ListenOptions;
 }): Promise<void> {
+  // Before ensureServer, so a refused URL starts no server.
+  const { url: prUrl } = resolvePullRequestUrl(options.prUrl);
   const { state, started } = await ensureServer(options.listen);
   const base = serverBaseUrl(state);
   const response = await fetch(`${base}/api/sessions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      prUrl: options.prUrl,
+      prUrl,
       commentImports: options.commentImports,
       clean: options.clean,
     }),

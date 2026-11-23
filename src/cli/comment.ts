@@ -1,9 +1,9 @@
 import { Command, Option } from 'commander';
 
-import { sessionIdForPullRequest } from '../server/multi-server.js';
 import { parseCommentImportValue } from '../utils/commentImports.js';
 import { SESSION_ID_LENGTH } from '../utils/sessionPath.js';
 
+import { resolvePullRequestUrl } from './serve.js';
 import { findServer, notAnswering, serverBaseUrl } from './server-state.js';
 import { detectStdinSource, readStdin } from './utils.js';
 
@@ -41,11 +41,7 @@ function sessionIdOf({ session, pr }: ServerOptions): string | undefined {
     return session;
   }
   if (pr !== undefined) {
-    const id = sessionIdForPullRequest(pr);
-    if (id === null) {
-      throw new Error('--pr must be a URL like https://github.com/<owner>/<repo>/pull/<number>');
-    }
-    return id;
+    return resolvePullRequestUrl(pr).sessionId;
   }
   return undefined;
 }
