@@ -5,9 +5,37 @@ import { fetch } from 'undici';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import pkg from '../../package.json' with { type: 'json' };
+import { getPrCommentImports, getPrPatch, getPrTitle } from '../cli/github.js';
 import { type CommentImport } from '../types/diff.js';
 
 import { createMultiSessionApp, type PullRequestSource, startMultiServer } from './multi-server.js';
+
+const { ghMock } = vi.hoisted(() => ({ ghMock: vi.fn() }));
+
+// The gh-backed PullRequestSource runs gh through ghMock, as in cli/github.test.ts.
+// Synchronous runs fail the test, so no test reaches the real gh. Named imports of a
+// built-in resolve through `default`, so the mock replaces both.
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('child_process')>();
+  const { promisify } = await import('util');
+  const execFile = Object.assign(
+    (file: string, args: string[], options: object, callback: (...result: unknown[]) => void) => {
+      ghMock(file, args, options).then(
+        ({ stdout, stderr }: { stdout: string; stderr: string }) => callback(null, stdout, stderr),
+        (error: unknown) => callback(error, '', ''),
+      );
+    },
+    { [promisify.custom]: (...args: unknown[]) => ghMock(...args) },
+  );
+  const mocked = {
+    ...actual,
+    execFile,
+    execFileSync: () => {
+      throw new Error('gh must not run synchronously');
+    },
+  };
+  return { ...mocked, default: mocked };
+});
 
 const PR_A = 'https://github.com/octo/alpha/pull/1';
 const PR_B = 'https://github.com/octo/beta/pull/2';
@@ -407,6 +435,85 @@ describe('POST /api/sessions', () => {
     const comments = await getJson(`${base}${body.url}api/comments-json`);
     expect(comments.threads.map((thread: { id: string }) => thread.id)).toEqual(['bot-1']);
     expect(consoleWarn.mock.calls.flat().join('\n')).toContain('octo/alpha#1');
+  });
+});
+
+describe('a gh run that never exits', () => {
+  const ghSource: PullRequestSource = { getPrPatch, getPrCommentImports, getPrTitle };
+
+  // Like execFile, a run fails once its options.timeout elapses, which is when the returned
+  // function is called. A run without a timeout hangs.
+  function hangGh() {
+    const elapse: Array<() => void> = [];
+    ghMock.mockImplementation(
+      (file: string, args: string[], options: { timeout?: number; killSignal?: string }) =>
+        new Promise((_resolve, reject) => {
+          if (options.timeout !== undefined && options.timeout > 0) {
+            elapse.push(() =>
+              reject(
+                Object.assign(new Error(`Command failed: ${file} ${args.join(' ')}\n`), {
+                  killed: true,
+                  code: null,
+                  signal: options.killSignal ?? 'SIGTERM',
+                  stdout: '',
+                  stderr: '',
+                }),
+              ),
+            );
+          }
+        }),
+    );
+    return () => {
+      for (const fire of elapse.splice(0)) {
+        fire();
+      }
+    };
+  }
+
+  // Answers gh pr diff, gh api graphql, and gh pr view for PR_A.
+  function answerGh(_file: string, args: string[]) {
+    const stdout =
+      args[0] === 'api'
+        ? JSON.stringify({ data: null })
+        : args[1] === 'view'
+          ? JSON.stringify({ title: 'Alpha' })
+          : patchFor('alpha.ts');
+    return Promise.resolve({ stdout, stderr: '' });
+  }
+
+  afterEach(() => {
+    ghMock.mockReset();
+  });
+
+  it('answers 502 once gh times out, then lets the same PR be opened again', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const elapseTimeout = hangGh();
+    const { base } = await startApp(ghSource);
+    // Ids are deterministic, so another server tells the id before this one finishes.
+    const { id } = await openPr((await startApp()).base, PR_A);
+
+    const creation = createSession(base, { prUrl: PR_A });
+    await vi.waitFor(() => expect(ghMock).toHaveBeenCalledTimes(3));
+    expect((await deleteSession(base, id)).status).toBe(409);
+
+    elapseTimeout();
+
+    expect((await deleteSession(base, id)).status).toBe(404);
+    const response = await creation;
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({
+      error:
+        'Could not fetch the pull request with gh. Check that it exists and that gh is installed and logged in (gh auth status). The server log has the details.',
+    });
+    expect(consoleError.mock.calls.flat().join('\n')).toContain(
+      'Failed to fetch octo/alpha#1 with gh: gh timed out after 90 seconds',
+    );
+    expect(await listSessions(base)).toEqual([]);
+
+    ghMock.mockImplementation(answerGh);
+    await openPr(base, PR_A);
+    expect((await listSessions(base)).map((session) => session.id)).toEqual([id]);
   });
 });
 

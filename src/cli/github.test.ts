@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   getPrCommentImports,
@@ -522,6 +522,73 @@ describe('CLI GitHub utils', () => {
       ghMock.mockResolvedValueOnce({ stdout: 'not json', stderr: '' });
 
       await expect(getPrTitle(PR_URL)).rejects.toThrow(/^Invalid JSON returned from gh pr view$/);
+    });
+
+    describe('when gh never exits', () => {
+      // A stalled gh must not leave its caller waiting forever.
+      const GH_TIMEOUT_MS = 90_000;
+
+      beforeEach(() => {
+        vi.useFakeTimers();
+        // Like execFile, the run is killed and fails once options.timeout elapses.
+        // Without a timeout it hangs.
+        ghMock.mockImplementation(
+          (file: string, args: string[], options: { timeout?: number; killSignal?: string }) =>
+            new Promise((_resolve, reject) => {
+              if (options.timeout !== undefined && options.timeout > 0) {
+                setTimeout(() => {
+                  reject(
+                    Object.assign(new Error(`Command failed: ${file} ${args.join(' ')}\n`), {
+                      killed: true,
+                      code: null,
+                      signal: options.killSignal ?? 'SIGTERM',
+                      stdout: '',
+                      stderr: '',
+                    }),
+                  );
+                }, options.timeout);
+              }
+            }),
+        );
+      });
+
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      it.each([
+        ['gh pr diff', getPrPatch],
+        ['gh api graphql', getPrCommentImports],
+        ['gh pr view', getPrTitle],
+      ])(
+        'kills %s with SIGKILL after 90 seconds and reports the timeout',
+        async (_command, run) => {
+          let outcome: unknown = 'running';
+          void run(PR_URL).then(
+            () => {
+              outcome = 'resolved';
+            },
+            (error: unknown) => {
+              outcome = error;
+            },
+          );
+
+          await vi.advanceTimersByTimeAsync(GH_TIMEOUT_MS - 1);
+          expect(outcome).toBe('running');
+          await vi.advanceTimersByTimeAsync(1);
+
+          expect(outcome).toEqual(
+            expect.objectContaining({
+              message: expect.stringMatching(/^gh timed out after 90 seconds/),
+            }),
+          );
+          expect(ghMock).toHaveBeenCalledWith(
+            'gh',
+            expect.any(Array),
+            expect.objectContaining({ timeout: GH_TIMEOUT_MS, killSignal: 'SIGKILL' }),
+          );
+        },
+      );
     });
   });
 });
