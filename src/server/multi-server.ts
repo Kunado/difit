@@ -61,7 +61,6 @@ const GH_FAILURE_ERROR =
 const SESSION_ID_LENGTH = 16;
 const MAX_BODY_SIZE = '1mb';
 const SSE_PATHS = new Set(['/api/watch', '/api/heartbeat']);
-const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 const LOOPBACK_HOST_NAMES = ['localhost', '127.0.0.1', '[::1]'];
 const LISTEN_HOSTS = new Set(['localhost', '127.0.0.1']);
 const GITHUB_TOKEN_PATTERN = /\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+/g;
@@ -75,7 +74,15 @@ function parsePullRequestUrl(value: unknown): PullRequestRef | null {
   }
   const match = PR_URL_PATTERN.exec(value);
   const [, owner, repo, digits] = match ?? [];
-  if (!owner || !repo || !digits || repo === '.' || repo.includes('..')) {
+  // A `.git` suffix names the same repository, so it would open a duplicate session.
+  if (
+    !owner ||
+    !repo ||
+    !digits ||
+    repo === '.' ||
+    repo.includes('..') ||
+    repo.toLowerCase().endsWith('.git')
+  ) {
     return null;
   }
   const number = Number(digits);
@@ -137,8 +144,9 @@ const toSessionInfo = (entry: SessionEntry) => ({
   createdAt: entry.createdAt,
 });
 
-// Blocks DNS rebinding (a foreign Host) and cross-site writes (a foreign Origin). The
-// session routes are guarded too: they expose PR contents and accept comment writes.
+// Blocks DNS rebinding (a foreign Host) and requests from other sites (a foreign Origin).
+// Reads are covered too: the watch and heartbeat routes send Access-Control-Allow-Origin: *,
+// and session routes expose PR contents. Same-origin pages and non-browser clients pass.
 function guardRequest(req: Request, res: Response, next: NextFunction): void {
   const { host, origin } = req.headers;
   const port = req.socket.localPort;
@@ -146,7 +154,7 @@ function guardRequest(req: Request, res: Response, next: NextFunction): void {
     res.status(403).json({ error: 'Host not allowed' });
     return;
   }
-  if (!SAFE_METHODS.has(req.method) && origin !== undefined && origin !== `http://${host}`) {
+  if (origin !== undefined && origin !== `http://${host}`) {
     res.status(403).json({ error: 'Cross-origin request not allowed' });
     return;
   }
@@ -240,17 +248,26 @@ export function createMultiSessionApp({ github }: { github: PullRequestSource })
     };
   }
 
+  // An open session keeps its state; only the request's commentImports are added to it.
+  // `clean` applies at creation only.
+  function reuseSession(entry: SessionEntry, request: CreateSessionRequest) {
+    if (request.commentImports.length > 0) {
+      entry.session.importComments(request.commentImports);
+    }
+    return { entry, created: false };
+  }
+
   async function openSession(
     request: CreateSessionRequest,
   ): Promise<{ entry: SessionEntry; created: boolean }> {
     const { id, repositoryId } = identifySession(request.pr);
     const existing = sessions.get(id);
     if (existing) {
-      return { entry: existing, created: false };
+      return reuseSession(existing, request);
     }
     const pending = creating.get(id);
     if (pending) {
-      return { entry: await pending, created: false };
+      return reuseSession(await pending, request);
     }
 
     const creation = createEntry(id, repositoryId, request)
@@ -298,6 +315,10 @@ export function createMultiSessionApp({ github }: { github: PullRequestSource })
   });
 
   app.delete('/api/sessions/:id', requireJsonContentType, async (req, res) => {
+    if (creating.has(req.params.id)) {
+      res.status(409).json({ error: 'Session is still being created; retry once it is open' });
+      return;
+    }
     const entry = sessions.get(req.params.id);
     if (!entry) {
       res.status(404).json({ error: 'Unknown session' });
@@ -320,11 +341,13 @@ export function createMultiSessionApp({ github }: { github: PullRequestSource })
       res.status(404).json({ error: 'Unknown session' });
       return;
     }
-    if ((req.method === 'GET' || req.method === 'HEAD') && SSE_PATHS.has(req.path)) {
+    // Express matches routes ignoring case and one trailing slash; compare the same way.
+    const routePath = req.path.toLowerCase().replace(/\/$/, '');
+    if ((req.method === 'GET' || req.method === 'HEAD') && SSE_PATHS.has(routePath)) {
       entry.streams.add(res);
       res.on('close', () => entry.streams.delete(res));
     }
-    if (entry.pendingClean && req.method === 'GET' && req.path === '/api/diff') {
+    if (entry.pendingClean && req.method === 'GET' && routePath === '/api/diff') {
       announceCleanOnce(entry, res);
     }
     entry.session.router(req, res, next);

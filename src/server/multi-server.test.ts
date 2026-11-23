@@ -65,6 +65,18 @@ function fakeGitHub() {
   } satisfies PullRequestSource;
 }
 
+// Holds the next gh pr diff until the returned function is called.
+function holdPatch(github: ReturnType<typeof fakeGitHub>) {
+  let release = () => {};
+  github.getPrPatch.mockImplementationOnce(
+    (prUrl: string) =>
+      new Promise<string>((resolve) => {
+        release = () => resolve(patchFor(fileOf(prUrl)));
+      }),
+  );
+  return () => release();
+}
+
 async function startApp(github: PullRequestSource = fakeGitHub()) {
   const app = createMultiSessionApp({ github });
   const server = app.listen(0, '127.0.0.1');
@@ -232,19 +244,55 @@ describe('POST /api/sessions', () => {
     expect(github.getPrPatch).toHaveBeenCalledTimes(1);
   });
 
-  it('shares one creation between concurrent requests for the same PR', async () => {
-    const { base, github } = await startApp();
+  it('shares one gh fetch between concurrent requests for the same PR', async () => {
+    const github = fakeGitHub();
+    const releasePatch = holdPatch(github);
+    const { base } = await startApp(github);
 
-    const responses = await Promise.all([
-      createSession(base, { prUrl: PR_A }),
-      createSession(base, { prUrl: PR_A }),
-    ]);
+    const first = createSession(base, { prUrl: PR_A });
+    await vi.waitFor(() => expect(github.getPrPatch).toHaveBeenCalledTimes(1));
+    const second = createSession(base, {
+      prUrl: PR_A,
+      commentImports: [commentImport('late-1', 'alpha.ts', 'sent while gh ran')],
+    });
+    // Let the second request reach the server while gh is still running.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    releasePatch();
 
-    expect(responses.map((response) => response.status).sort((x, y) => x - y)).toEqual([200, 201]);
-    const [a, b] = await Promise.all(responses.map((response) => response.json()));
-    expect(a).toEqual(b);
+    const responses = await Promise.all([first, second]);
+    expect(responses.map((response) => response.status)).toEqual([201, 200]);
+    const [a, b] = (await Promise.all(responses.map((response) => response.json()))) as Array<{
+      url: string;
+    }>;
+    expect(b).toEqual(a);
     expect(await listSessions(base)).toHaveLength(1);
     expect(github.getPrPatch).toHaveBeenCalledTimes(1);
+    const comments = await getJson(`${base}${a!.url}api/comments-json`);
+    expect(comments.threads.map((thread: { id: string }) => thread.id)).toEqual(['late-1']);
+  });
+
+  it('adds commentImports sent for an open session to that session', async () => {
+    const { base } = await startApp();
+    const a = await openPr(base, PR_A, {
+      commentImports: [commentImport('bot-1', 'alpha.ts', 'first pass')],
+    });
+    const watch = await openEventStream(`${base}${a.url}api/watch`);
+    await vi.waitFor(() => expect(watch.events).toEqual([{ type: 'connected' }]));
+
+    const again = await createSession(base, {
+      prUrl: PR_A,
+      commentImports: [commentImport('bot-2', 'alpha.ts', 'second pass')],
+    });
+
+    expect(again.status).toBe(200);
+    const comments = await getJson(`${base}${a.url}api/comments-json`);
+    expect(comments.threads.map((thread: { id: string }) => thread.id)).toEqual(['bot-1', 'bot-2']);
+    await vi.waitFor(() =>
+      expect(watch.events).toEqual([
+        { type: 'connected' },
+        { type: 'commentsChanged', version: 2 },
+      ]),
+    );
   });
 
   it.each([
@@ -264,6 +312,7 @@ describe('POST /api/sessions', () => {
     ['fragment', 'https://github.com/octo/alpha/pull/1#discussion'],
     ['dot-dot segment', 'https://github.com/octo/../pull/1'],
     ['dot-dot in repo', 'https://github.com/octo/al..pha/pull/1'],
+    ['.git suffix', 'https://github.com/octo/alpha.git/pull/1'],
     ['single-dot repo', 'https://github.com/octo/./pull/1'],
     ['encoded characters', 'https://github.com/octo/al%2Fpha/pull/1'],
     ['space', 'https://github.com/octo/al pha/pull/1'],
@@ -461,10 +510,15 @@ describe('DELETE /api/sessions/:id', () => {
     const b = await openPr(base, PR_B);
     const watchA = await openEventStream(`${base}${a.url}api/watch`);
     const heartbeatA = await openEventStream(`${base}${a.url}api/heartbeat`);
+    // Express routes ignore case and a trailing slash, so these reach the same handlers.
+    const watchVariantA = await openEventStream(`${base}${a.url}API/Watch/`);
+    const heartbeatVariantA = await openEventStream(`${base}${a.url}api/heartbeat/`);
     const watchB = await openEventStream(`${base}${b.url}api/watch`);
     await vi.waitFor(() => {
       expect(watchA.events).toEqual([{ type: 'connected' }]);
       expect(heartbeatA.events).toEqual([{ type: 'connected' }]);
+      expect(watchVariantA.events).toEqual([{ type: 'connected' }]);
+      expect(heartbeatVariantA.events).toEqual([{ type: 'connected' }]);
       expect(watchB.events).toEqual([{ type: 'connected' }]);
     });
 
@@ -472,8 +526,9 @@ describe('DELETE /api/sessions/:id', () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ success: true, id: a.id });
-    expect(await settledWithin(watchA.ended, 2000)).toBe(true);
-    expect(await settledWithin(heartbeatA.ended, 2000)).toBe(true);
+    for (const stream of [watchA, heartbeatA, watchVariantA, heartbeatVariantA]) {
+      expect(await settledWithin(stream.ended, 2000)).toBe(true);
+    }
     expect(await settledWithin(watchB.ended, 200)).toBe(false);
 
     expect((await fetch(`${base}${a.url}api/diff`)).status).toBe(404);
@@ -500,6 +555,24 @@ describe('DELETE /api/sessions/:id', () => {
       expect((await fetch(`${base}/s/no-such-session/${path}`)).status).toBe(404);
     }
     expect(await listSessions(base)).toHaveLength(1);
+  });
+
+  it('answers 409 while the session is still being created, then keeps it', async () => {
+    const github = fakeGitHub();
+    const releasePatch = holdPatch(github);
+    const { base } = await startApp(github);
+    // Ids are deterministic, so another server tells the id before this one finishes.
+    const { id } = await openPr((await startApp()).base, PR_A);
+
+    const creation = createSession(base, { prUrl: PR_A });
+    await vi.waitFor(() => expect(github.getPrPatch).toHaveBeenCalledTimes(1));
+    const response = await deleteSession(base, id);
+    releasePatch();
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: expect.any(String) });
+    expect((await creation).status).toBe(201);
+    expect((await listSessions(base)).map((session) => session.id)).toEqual([id]);
   });
 
   it('does not serve session routes outside /s/<id>/', async () => {
@@ -598,12 +671,28 @@ describe('request guards', () => {
     }
   });
 
-  it('rejects writes from another origin', async () => {
+  it('rejects requests from another origin, reads included', async () => {
     const { base, port, github } = await startApp();
     const a = await openPr(base, PR_A);
     const host = `127.0.0.1:${port}`;
 
     for (const origin of ['http://evil.example', `http://localhost:${port + 1}`, 'null']) {
+      // The watch and heartbeat routes send Access-Control-Allow-Origin: *, so a
+      // foreign page could read them with EventSource if the request got through.
+      for (const path of [
+        '/api/sessions',
+        '/api/server-info',
+        `${a.url}api/watch`,
+        `${a.url}api/heartbeat`,
+        `${a.url}api/comments-json`,
+      ]) {
+        const read = await rawRequest(port, {
+          method: 'GET',
+          path,
+          headers: { Host: host, Origin: origin },
+        });
+        expect(read.status).toBe(403);
+      }
       const headers = { Host: host, Origin: origin, 'Content-Type': 'application/json' };
       const post = await rawRequest(port, {
         method: 'POST',
@@ -636,6 +725,12 @@ describe('request guards', () => {
       body: JSON.stringify({ prUrl: PR_B }),
     });
     expect(sameOrigin.status).toBe(201);
+    const sameOriginRead = await rawRequest(port, {
+      method: 'GET',
+      path: '/api/sessions',
+      headers: { Host: host, Origin: `http://${host}` },
+    });
+    expect(sameOriginRead.status).toBe(200);
   });
 
   it('requires a JSON content type on session writes', async () => {
@@ -684,7 +779,7 @@ describe('request guards', () => {
     expect(github.getPrPatch).not.toHaveBeenCalled();
   });
 
-  it('does not grant cross-origin access through CORS headers', async () => {
+  it('adds no CORS headers of its own to the sessions API', async () => {
     const { base, port } = await startApp();
 
     const created = await createSession(base, { prUrl: PR_A });
