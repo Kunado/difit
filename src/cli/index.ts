@@ -182,7 +182,7 @@ program
         }
 
         try {
-          stdinDiff = getPrPatch(options.pr);
+          stdinDiff = await getPrPatch(options.pr);
           stdinReviewLabel = options.pr;
         } catch (error) {
           console.error(

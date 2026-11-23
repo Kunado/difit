@@ -1,6 +1,21 @@
-import { execFileSync } from 'child_process';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 
 import type { CommentImport, DiffCommentPosition, DiffLineRange } from '../types/diff.js';
+
+const execFileAsync = promisify(execFile);
+
+// gh hands back its whole output at once. Node's default cap (1 MiB) cuts off the
+// patch of a large PR; 64 MiB covers any diff GitHub serves while staying bounded.
+const MAX_GH_OUTPUT_BYTES = 64 * 1024 * 1024;
+
+async function runGh(args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync('gh', args, {
+    encoding: 'utf8',
+    maxBuffer: MAX_GH_OUTPUT_BYTES,
+  });
+  return stdout;
+}
 
 interface PullRequestInfo {
   owner: string;
@@ -326,12 +341,10 @@ export function parseGitHubPrUrl(url: string): PullRequestInfo | null {
   }
 }
 
-export function getPrPatch(prArg: string): string {
+export async function getPrPatch(prArg: string): Promise<string> {
   try {
-    const patch = execFileSync('gh', ['pr', 'diff', prArg], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    // `--` keeps an argument that starts with `-` from being read as an option.
+    const patch = await runGh(['pr', 'diff', '--', prArg]);
 
     if (!patch.trim()) {
       throw new Error('No diff content returned from gh pr diff');
@@ -373,7 +386,7 @@ export function parsePrCommentImportsResponse(
   };
 }
 
-export function getPrCommentImports(prArg: string): Promise<CommentImport[]> {
+export async function getPrCommentImports(prArg: string): Promise<CommentImport[]> {
   const pullRequestInfo = parseGitHubPrUrl(prArg);
   if (!pullRequestInfo) {
     throw new Error('Invalid GitHub PR URL');
@@ -404,16 +417,13 @@ export function getPrCommentImports(prArg: string): Promise<CommentImport[]> {
         args.push('-F', `endCursor=${endCursor}`);
       }
 
-      const stdout = execFileSync('gh', args, {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      const stdout = await runGh(args);
       const parsed = JSON.parse(stdout) as GitHubReviewThreadsGraphqlResponse;
       const page = parsePrCommentImportsResponse(parsed);
       commentImports.push(...page.commentImports);
 
       if (!page.pageInfo.hasNextPage) {
-        return Promise.resolve(commentImports);
+        return commentImports;
       }
 
       if (!page.pageInfo.endCursor) {
