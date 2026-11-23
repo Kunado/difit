@@ -17,9 +17,10 @@ import {
 } from './background.js';
 import { getPrCommentImports, getPrPatch, getPrTitle } from './github.js';
 import {
-  answersAsServer,
   claimServerState,
   findServer,
+  notAnswering,
+  probeServer,
   releaseServerState,
   removeStaleServerState,
   serverBaseUrl,
@@ -65,6 +66,9 @@ async function serve({ port, host = 'localhost' }: ListenOptions): Promise<Serve
   const found = await findServer();
   if (found.kind === 'running') {
     throw alreadyRunning(found.state);
+  }
+  if (found.kind === 'unresponsive') {
+    throw notAnswering(found.state);
   }
   if (found.kind === 'stale') {
     removeStaleServerState(found.raw);
@@ -153,11 +157,21 @@ async function stopServer(): Promise<void> {
       removeStaleServerState(found.raw);
       console.log(`No difit server is running; removed a stale state file (${found.reason})`);
       return;
+    case 'unresponsive':
+      // Possibly a busy difit server; without its answer the pid gets no signal.
+      throw notAnswering(found.state);
     case 'running': {
       const { state } = found;
-      process.kill(state.pid, 'SIGTERM');
+      try {
+        process.kill(state.pid, 'SIGTERM');
+      } catch (error) {
+        // ESRCH: it exited after the check, which is the outcome asked for.
+        if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) {
+          throw error;
+        }
+      }
       const deadline = Date.now() + STOP_TIMEOUT_MS;
-      while (await answersAsServer(state)) {
+      while (['this-server', 'no-answer'].includes(await probeServer(state))) {
         if (Date.now() > deadline) {
           throw new Error(`The difit server (pid ${state.pid}) did not stop within 10 seconds`);
         }
@@ -195,6 +209,9 @@ async function ensureServer(
   const found = await findServer();
   if (found.kind === 'running') {
     return { state: found.state, started: false };
+  }
+  if (found.kind === 'unresponsive') {
+    throw notAnswering(found.state);
   }
   let startError: unknown;
   try {

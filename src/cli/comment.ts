@@ -4,7 +4,7 @@ import { sessionIdForPullRequest } from '../server/multi-server.js';
 import { parseCommentImportValue } from '../utils/commentImports.js';
 import { SESSION_ID_LENGTH } from '../utils/sessionPath.js';
 
-import { findServer, serverBaseUrl } from './server-state.js';
+import { findServer, notAnswering, serverBaseUrl } from './server-state.js';
 import { detectStdinSource, readStdin } from './utils.js';
 
 interface CommentImportResponse {
@@ -59,6 +59,9 @@ async function resolveApiBase(opts: ServerOptions): Promise<string> {
     origin = `http://localhost:${opts.port}`;
   } else if (sessionId !== undefined) {
     const found = await findServer();
+    if (found.kind === 'unresponsive') {
+      throw notAnswering(found.state);
+    }
     if (found.kind !== 'running') {
       throw new Error('No difit server is running. Start one with difit serve, or pass --port');
     }

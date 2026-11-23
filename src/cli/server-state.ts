@@ -17,7 +17,12 @@ export interface ServerState {
 type ServerLookup =
   | { kind: 'none' }
   | { kind: 'running'; state: ServerState }
+  // The process lives but its port gave no answer in time: maybe a busy difit server.
+  | { kind: 'unresponsive'; state: ServerState }
   | { kind: 'stale'; raw: string; reason: string };
+
+/** What a state's port says to /api/server-info. */
+type ProbeResult = 'this-server' | 'other' | 'refused' | 'no-answer';
 
 const PROBE_TIMEOUT_MS = 2_000;
 
@@ -59,29 +64,44 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-/** Whether the state's port answers as the multi-session server of the state's pid. */
-export async function answersAsServer(state: ServerState): Promise<boolean> {
+// fetch reports a refused connection as a TypeError whose cause has the code; with
+// several addresses for the host (localhost), the cause is an AggregateError of them.
+function isConnectionRefused(error: unknown): boolean {
+  const cause = typeof error === 'object' && error !== null && 'cause' in error && error.cause;
+  if (isErrorCode(cause, 'ECONNREFUSED')) {
+    return true;
+  }
+  return (
+    cause instanceof AggregateError &&
+    cause.errors.length > 0 &&
+    cause.errors.every((attempt) => isErrorCode(attempt, 'ECONNREFUSED'))
+  );
+}
+
+/** Asks the state's port whether it is the multi-session server of the state's pid. */
+export async function probeServer(state: ServerState): Promise<ProbeResult> {
+  let info: unknown;
   try {
     const response = await fetch(`${serverBaseUrl(state)}/api/server-info`, {
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     });
     if (!response.ok) {
-      return false;
+      return 'other';
     }
-    const info: unknown = await response.json();
-    return (
-      typeof info === 'object' &&
-      info !== null &&
-      'app' in info &&
-      info.app === 'difit' &&
-      'mode' in info &&
-      info.mode === 'multi' &&
-      'pid' in info &&
-      info.pid === state.pid
-    );
-  } catch {
-    return false;
+    info = await response.json().catch(() => undefined);
+  } catch (error) {
+    return isConnectionRefused(error) ? 'refused' : 'no-answer';
   }
+  return typeof info === 'object' &&
+    info !== null &&
+    'app' in info &&
+    info.app === 'difit' &&
+    'mode' in info &&
+    info.mode === 'multi' &&
+    'pid' in info &&
+    info.pid === state.pid
+    ? 'this-server'
+    : 'other';
 }
 
 export async function findServer(): Promise<ServerLookup> {
@@ -101,15 +121,30 @@ export async function findServer(): Promise<ServerLookup> {
   if (!isProcessAlive(state.pid)) {
     return { kind: 'stale', raw, reason: `process ${state.pid} is not running` };
   }
-  if (!(await answersAsServer(state))) {
-    return {
-      kind: 'stale',
-      raw,
-      reason: `${serverBaseUrl(state)} is not the difit server of process ${state.pid}`,
-    };
+  const probe = await probeServer(state);
+  switch (probe) {
+    case 'this-server':
+      return { kind: 'running', state };
+    case 'no-answer':
+      return { kind: 'unresponsive', state };
+    case 'other':
+    case 'refused':
+      return {
+        kind: 'stale',
+        raw,
+        reason: `${serverBaseUrl(state)} is not the difit server of process ${state.pid}`,
+      };
+    default: {
+      const _exhaustive: never = probe;
+      return _exhaustive;
+    }
   }
-  return { kind: 'running', state };
 }
+
+export const notAnswering = (state: ServerState) =>
+  new Error(
+    `The difit server in ${getServerStatePath()} (pid ${state.pid}, ${serverBaseUrl(state)}) is running but not answering. Try again in a moment.`,
+  );
 
 // Removes the file only if it still holds what was judged, so a server that claimed it
 // in the meantime keeps its file.
