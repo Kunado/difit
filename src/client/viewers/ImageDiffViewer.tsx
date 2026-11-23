@@ -1,6 +1,7 @@
 import { useState } from 'react';
 
 import { DEFAULT_DIFF_VIEW_MODE } from '../../utils/diffMode';
+import { sessionApiUrl } from '../utils/sessionApi';
 
 import type { DiffViewerBodyProps } from './types';
 
@@ -18,7 +19,8 @@ const blobKey = (ref: string, path: string): string => `${ref.slice(0, 7)}:${pat
 
 const imageBlobUrl = (path: string, ref: string): string => {
   const staticBlobUrls = (window as Window & StaticBlobWindow).__DIFIT_STATIC_BLOB_URLS__;
-  return staticBlobUrls?.[blobKey(ref, path)] ?? `/api/blob/${path}?ref=${ref}`;
+  // An <img> request bypasses fetch, so it gets the session prefix here.
+  return staticBlobUrls?.[blobKey(ref, path)] ?? sessionApiUrl(`/api/blob/${path}?ref=${ref}`);
 };
 
 export function ImageDiffViewer({

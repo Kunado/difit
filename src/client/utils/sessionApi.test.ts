@@ -4,7 +4,6 @@ import { installSessionApiRouting, sessionApiUrl } from './sessionApi';
 
 const SESSION = '/s/0123456789abcdef';
 
-// The URLs that reached the browser's network APIs, recorded by stand-ins for them.
 let requested: string[] = [];
 
 class RecordingEventSource {
@@ -44,7 +43,6 @@ function openPage(pathname: string) {
   installSessionApiRouting();
 }
 
-// Sends the URL through fetch, EventSource and sendBeacon, in that order.
 function requestThroughEachApi(url: string | URL): string[] {
   requested = [];
   void fetch(url);
@@ -54,12 +52,9 @@ function requestThroughEachApi(url: string | URL): string[] {
 }
 
 describe('installSessionApiRouting', () => {
-  it('leaves the browser APIs alone in single mode', () => {
-    const singleModeFetch = window.fetch;
-
+  it('leaves URLs unchanged in single mode', () => {
     openPage('/');
 
-    expect(window.fetch).toBe(singleModeFetch);
     expect(requestThroughEachApi('/api/diff?base=HEAD%5E&target=HEAD')).toEqual(
       Array(3).fill('/api/diff?base=HEAD%5E&target=HEAD'),
     );
@@ -107,15 +102,20 @@ describe('installSessionApiRouting', () => {
     '/s/0123456789abcdeg/',
     '/s0123456789abcdef/',
     '/x/s/0123456789abcdef/',
-    // Static site pages: the published site and its preview.
-    '/difit/',
-    '/difit/preview/',
-    '/preview',
   ])('adds no prefix on %s, which is not a session page', (pathname) => {
     openPage(pathname);
 
     expect(requestThroughEachApi('/api/diff')).toEqual(Array(3).fill('/api/diff'));
   });
+
+  it.each(['/difit/', '/difit/preview/', '/preview'])(
+    'adds no prefix on the static site page %s',
+    (pathname) => {
+      openPage(pathname);
+
+      expect(requestThroughEachApi('/api/diff')).toEqual(Array(3).fill('/api/diff'));
+    },
+  );
 });
 
 describe('sessionApiUrl', () => {

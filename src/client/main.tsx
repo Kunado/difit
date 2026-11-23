@@ -4,6 +4,9 @@ import { HotkeysProvider } from 'react-hotkeys-hook';
 
 import App from './App';
 import './styles/global.css';
+import { installSessionApiRouting } from './utils/sessionApi';
+
+installSessionApiRouting();
 
 const rootElement = document.getElementById('root');
 
