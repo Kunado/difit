@@ -211,14 +211,15 @@ function announceCleanOnce(entry: SessionEntry, res: Response): void {
   };
 }
 
-function sendReviewPage(clientDir: string, res: Response): void {
+// The one client page: the session list at /, a review page at /s/<id>/.
+function sendClientPage(clientDir: string, res: Response): void {
   const indexPath = join(clientDir, 'index.html');
   // With `root`, send's default dotfiles: 'ignore' checks only the path below clientDir,
   // not dot directories above it such as ~/.npm/_npx/.
   res.sendFile('index.html', { root: clientDir }, (error) => {
     if (error && !res.headersSent) {
       console.error(`Could not serve ${indexPath}: ${describeError(error)}`);
-      res.status(500).json({ error: 'Could not serve the review page' });
+      res.status(500).json({ error: 'Could not serve the client page' });
     }
   });
 }
@@ -353,6 +354,10 @@ export function createMultiSessionApp({
     res.json({ success: true, id: entry.id });
   });
 
+  app.get('/', (_req, res) => {
+    sendClientPage(clientDir, res);
+  });
+
   app.use('/s/:id', (req, res, next) => {
     const entry = sessions.get(req.params.id);
     if (!entry) {
@@ -362,7 +367,7 @@ export function createMultiSessionApp({
     // Express matches routes ignoring case and one trailing slash; compare the same way.
     const routePath = req.path.toLowerCase().replace(/\/$/, '');
     if (routePath === '' && (req.method === 'GET' || req.method === 'HEAD')) {
-      sendReviewPage(clientDir, res);
+      sendClientPage(clientDir, res);
       return;
     }
     if (entry.pendingClean && req.method === 'GET' && routePath === '/api/diff') {
