@@ -213,7 +213,9 @@ function announceCleanOnce(entry: SessionEntry, res: Response): void {
 
 function sendReviewPage(clientDir: string, res: Response): void {
   const indexPath = join(clientDir, 'index.html');
-  res.sendFile(indexPath, (error) => {
+  // With `root`, send's default dotfiles: 'ignore' checks only the path below clientDir,
+  // not dot directories above it such as ~/.npm/_npx/.
+  res.sendFile('index.html', { root: clientDir }, (error) => {
     if (error && !res.headersSent) {
       console.error(`Could not serve ${indexPath}: ${describeError(error)}`);
       res.status(500).json({ error: 'Could not serve the review page' });
