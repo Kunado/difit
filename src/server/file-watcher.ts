@@ -53,6 +53,8 @@ export class FileWatcherService {
   private debounceTimer: NodeJS.Timeout | null = null;
   private config: FileWatcherConfig | null = null;
   private git: SimpleGit | null = null;
+  // Bumped by each stop(). Work started under an older generation is stale.
+  private generation = 0;
 
   constructor() {}
 
@@ -64,8 +66,11 @@ export class FileWatcherService {
   ): Promise<void> {
     this.config = { watchPath, diffMode, debounceMs, onCacheInvalidate };
 
-    // Stop existing watchers
-    await this.stop();
+    // Stop existing watchers. Read the generation before awaiting, so that a stop()
+    // arriving during this start() is newer than it.
+    const stopped = this.stop();
+    const generation = this.generation;
+    await stopped;
 
     // No watching for specific commit comparisons
     if (diffMode === DiffMode.SPECIFIC) {
@@ -79,14 +84,18 @@ export class FileWatcherService {
     this.git = simpleGit(watchPath);
 
     try {
-      await this.setupWatchers(modeConfig, watchPath);
+      await this.setupWatchers(modeConfig, watchPath, generation);
     } catch (error) {
       console.error('❌ Failed to start file watcher:', error);
       throw error;
     }
   }
 
-  private async setupWatchers(modeConfig: ModeWatchConfig, basePath: string): Promise<void> {
+  private async setupWatchers(
+    modeConfig: ModeWatchConfig,
+    basePath: string,
+    generation: number,
+  ): Promise<void> {
     // Loaded lazily so environments without a native @parcel/watcher binding
     // (e.g. an unsupported platform) degrade to no live reload instead of
     // failing at module load time.
@@ -133,7 +142,8 @@ export class FileWatcherService {
               relevantEvents.push(event);
             }
 
-            if (relevantEvents.length > 0) {
+            // stop() may have run during the .gitignore checks above.
+            if (relevantEvents.length > 0 && generation === this.generation) {
               this.debouncedBroadcast();
             }
           },
@@ -142,6 +152,10 @@ export class FileWatcherService {
           },
         )) as { unsubscribe: () => Promise<void> };
 
+        if (generation !== this.generation) {
+          await subscription.unsubscribe();
+          return;
+        }
         this.subscriptions.push(subscription);
       } catch (error) {
         console.warn(`⚠️  Could not watch ${fullPath}:`, error);
@@ -213,6 +227,8 @@ export class FileWatcherService {
   }
 
   async stop(): Promise<void> {
+    this.generation += 1;
+
     // Clear debounce timer
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);

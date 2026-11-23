@@ -192,6 +192,26 @@ async function openEventStream(url: string) {
   return events;
 }
 
+// Collects a stream's raw text and records when the server ends it.
+async function openRawStream(url: string) {
+  const controller = new AbortController();
+  openStreams.push(controller);
+  const response = await fetch(url, { signal: controller.signal });
+  const stream = { text: '', ended: false };
+  const decoder = new TextDecoder();
+  void (async () => {
+    try {
+      for await (const chunk of response.body!) {
+        stream.text += decoder.decode(chunk, { stream: true });
+      }
+      stream.ended = true;
+    } catch {
+      // Aborted in afterEach.
+    }
+  })();
+  return stream;
+}
+
 describe('two review sessions mounted on one app', () => {
   it('keeps comments separate per session', async () => {
     const { base } = await mountTwoSessions();
@@ -348,5 +368,37 @@ describe('two review sessions mounted on one app', () => {
       ]);
       expect(eventsB).toEqual([{ type: 'connected' }, { type: 'commentsChanged', version: 1 }]);
     });
+  });
+});
+
+describe('ReviewSession.dispose', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('ends open heartbeat and watch streams and leaves no heartbeat timer', async () => {
+    const onHeartbeatClose = vi.fn();
+    const { base, sessions } = await mountTwoSessions({ a: { onHeartbeatClose } });
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    const heartbeat = await openRawStream(`${base}/s/a/api/heartbeat`);
+    const watch = await openRawStream(`${base}/s/a/api/watch`);
+    await vi.waitFor(() => {
+      expect(heartbeat.text).toBe('data: connected\n\n');
+      expect(watch.text).toContain('"type":"connected"');
+    });
+    expect(vi.getTimerCount()).toBe(1);
+
+    await sessions.get('a')!.dispose();
+    // Checked before the request close events, which also stop the timer.
+    expect(vi.getTimerCount()).toBe(0);
+
+    await vi.waitFor(() => {
+      expect(heartbeat.ended).toBe(true);
+      expect(watch.ended).toBe(true);
+    });
+    vi.advanceTimersByTime(10_000);
+    expect(heartbeat.text).toBe('data: connected\n\n');
+    // dispose() closed the streams; no tab went away.
+    expect(onHeartbeatClose).not.toHaveBeenCalled();
   });
 });

@@ -1,7 +1,8 @@
 import type { Event } from '@parcel/watcher';
 import { type Response } from 'express';
 import { resolve } from 'path';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SimpleGit } from 'simple-git';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { DiffMode } from '../types/watch.js';
 
@@ -25,6 +26,15 @@ const { simpleGit } = await import('simple-git');
 const TEST_REPO_PATH = resolve('/test/path');
 const TEST_WORKTREE_PATH = resolve('/worktree/path');
 const TEST_REPOS_WORKTREE_PATH = resolve('/repos/worktree');
+
+// A promise the test resolves by hand.
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
 
 describe('FileWatcherService', () => {
   let fileWatcher: FileWatcherService;
@@ -120,6 +130,64 @@ describe('FileWatcherService', () => {
 
       // After stop, adding client should work normally (clients array should be cleared)
       expect(() => fileWatcher.addClient(mockResponse)).not.toThrow();
+    });
+  });
+
+  describe('after stop()', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('releases a subscription that resolves after stop()', async () => {
+      const subscribed = deferred<typeof mockSubscription>();
+      vi.mocked(subscribe).mockReturnValueOnce(subscribed.promise);
+
+      const starting = fileWatcher.start(DiffMode.DEFAULT, TEST_REPO_PATH, 300);
+      await vi.waitFor(() => expect(subscribe).toHaveBeenCalledTimes(1));
+      await fileWatcher.stop();
+      subscribed.resolve(mockSubscription);
+      await starting;
+
+      expect(mockSubscription.unsubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it('releases every subscription of a start() that stop() overtook', async () => {
+      // The order of startWatching() followed at once by dispose().
+      const starting = fileWatcher.start(DiffMode.WORKING, TEST_REPO_PATH, 300);
+      await fileWatcher.stop();
+      await starting;
+
+      expect(mockSubscription.unsubscribe).toHaveBeenCalledTimes(
+        vi.mocked(subscribe).mock.calls.length,
+      );
+    });
+
+    it('schedules no reload for an event whose .gitignore check outlasts stop()', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      const slowIgnoreCheck = deferred<string[]>();
+      vi.mocked(simpleGit).mockReturnValueOnce({
+        checkIgnore: vi.fn().mockResolvedValueOnce([]).mockReturnValueOnce(slowIgnoreCheck.promise),
+      } as unknown as SimpleGit);
+      const onCacheInvalidate = vi.fn();
+      await fileWatcher.start(DiffMode.WORKING, TEST_REPO_PATH, 300, onCacheInvalidate);
+      const subscribeCall = vi.mocked(subscribe).mock.calls[0];
+      const workingTreeCallback = subscribeCall[1];
+      const events: Event[] = [{ path: `${TEST_REPO_PATH}/a.txt`, type: 'update' }];
+
+      // Without stop(), the event schedules a reload.
+      await workingTreeCallback(null, events);
+      expect(vi.getTimerCount()).toBe(1);
+      vi.runAllTimers();
+      expect(onCacheInvalidate).toHaveBeenCalledTimes(1);
+
+      const handling = workingTreeCallback(null, events);
+      await fileWatcher.stop();
+      slowIgnoreCheck.resolve([]);
+      await handling;
+
+      expect(vi.getTimerCount()).toBe(0);
+      vi.runAllTimers();
+      expect(onCacheInvalidate).toHaveBeenCalledTimes(1);
     });
   });
 

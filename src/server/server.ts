@@ -786,6 +786,9 @@ export async function createReviewSession(
     }
   }
 
+  const streamClosers = new Set<() => void>();
+  let disposed = false;
+
   // SSE endpoint for file watching
   app.get('/api/watch', (req, res) => {
     res.writeHead(200, {
@@ -796,8 +799,11 @@ export async function createReviewSession(
     });
 
     fileWatcher.addClient(res);
+    const closeStream = () => res.end();
+    streamClosers.add(closeStream);
 
     req.on('close', () => {
+      streamClosers.delete(closeStream);
       fileWatcher.removeClient(res);
     });
   });
@@ -818,11 +824,20 @@ export async function createReviewSession(
     const heartbeatInterval = setInterval(() => {
       res.write('data: heartbeat\n\n');
     }, 5000);
+    const closeStream = () => {
+      clearInterval(heartbeatInterval);
+      res.end();
+    };
+    streamClosers.add(closeStream);
 
     // When client disconnects (tab closed, navigation, etc.)
     req.on('close', () => {
       clearInterval(heartbeatInterval);
-      hooks.onHeartbeatClose(handle);
+      streamClosers.delete(closeStream);
+      // A stream that dispose() ended is not a closed tab.
+      if (!disposed) {
+        hooks.onHeartbeatClose(handle);
+      }
     });
   });
 
@@ -840,7 +855,13 @@ export async function createReviewSession(
       const merged = mergeCommentImports(session.threads, commentImports);
       updateCommentSession(currentCommentSelection, merged.threads);
     },
-    dispose: () => fileWatcher.stop(),
+    dispose: async () => {
+      disposed = true;
+      for (const closeStream of streamClosers) {
+        closeStream();
+      }
+      await fileWatcher.stop();
+    },
   };
   return handle;
 }
