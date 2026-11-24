@@ -1,16 +1,15 @@
 // The CLI side of the multi-session server: `difit serve`, `difit stop`, and
 // `difit --pr <url>` adding the PR to the running server.
+import { resolve } from 'path';
 import { setTimeout as sleep } from 'timers/promises';
 
 import { Command } from 'commander';
 import open from 'open';
 
 import pkg from '../../package.json' with { type: 'json' };
-import {
-  type PullRequestSource,
-  sessionIdForPullRequest,
-  startMultiServer,
-} from '../server/multi-server.js';
+import { type PullRequestSource, startMultiServer } from '../server/multi-server.js';
+import { defaultPrListPath, openPrList } from '../server/pr-list.js';
+import { sessionIdForPullRequest } from '../server/pull-request-url.js';
 import { type CommentImport } from '../types/diff.js';
 
 import {
@@ -19,7 +18,7 @@ import {
   ignoreStdioErrorsForBackgroundDaemon,
   spawnBackgroundChild,
 } from './background.js';
-import { getPrCommentImports, getPrPatch, getPrTitle } from './github.js';
+import { getPrCommentImports, getPrPatch, getPrSummary } from './github.js';
 import {
   claimServerState,
   findServer,
@@ -36,14 +35,20 @@ interface ListenOptions {
   host?: string;
 }
 
+interface ServeOptions extends ListenOptions {
+  /** Absolute path of the PR list; the default list when absent. */
+  prs?: string;
+}
+
 const STOP_TIMEOUT_MS = 10_000;
+const SHUTDOWN_FLUSH_TIMEOUT_MS = 3_000;
 const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
 // A PR as a browser shows it: https://<host>/<owner>/<repo>/pull/<number>, optionally
 // followed by a page under it (/files), a trailing slash, a query, or a fragment.
 const PR_PAGE_PATTERN = /^https:\/\/([^/?#]+)(\/[^/?#]+\/[^/?#]+\/pull\/[^/?#]+)(?:[/?#].*)?$/s;
 const PR_URL_ERROR = '--pr must be a URL like https://github.com/<owner>/<repo>/pull/<number>';
 
-const github: PullRequestSource = { getPrPatch, getPrCommentImports, getPrTitle };
+const github: PullRequestSource = { getPrPatch, getPrCommentImports, getPrSummary };
 
 const alreadyRunning = (state: ServerState) =>
   new Error(
@@ -75,12 +80,13 @@ export function resolvePullRequestUrl(input: string): { url: string; sessionId: 
 }
 
 // The arguments a detached `difit serve` child gets.
-function serveArgs({ port, host }: ListenOptions): string[] {
+function serveArgs({ port, host, prs }: ServeOptions): string[] {
   return [
     'serve',
     '--no-open',
     ...(port === undefined ? [] : ['--port', String(port)]),
     ...(host ? ['--host', host] : []),
+    ...(prs === undefined ? [] : ['--prs', prs]),
   ];
 }
 
@@ -92,7 +98,11 @@ async function openInBrowser(url: string): Promise<void> {
   }
 }
 
-async function serve({ port, host = 'localhost' }: ListenOptions): Promise<ServerState> {
+async function serve({
+  port,
+  host = 'localhost',
+  prs = defaultPrListPath(),
+}: ServeOptions): Promise<ServerState> {
   const found = await findServer();
   if (found.kind === 'running') {
     throw alreadyRunning(found.state);
@@ -104,8 +114,18 @@ async function serve({ port, host = 'localhost' }: ListenOptions): Promise<Serve
     removeStaleServerState(found.raw);
   }
 
-  const { port: listeningPort, server } = await startMultiServer({
+  const prList = await openPrList(prs);
+  const warning = prList.warning();
+  if (warning) {
+    console.warn(`Warning: ${warning}`);
+  }
+  const {
+    port: listeningPort,
+    server,
+    restoreSessions,
+  } = await startMultiServer({
     github,
+    prList,
     preferredPort: port,
     host,
   });
@@ -123,20 +143,31 @@ async function serve({ port, host = 'localhost' }: ListenOptions): Promise<Serve
       ? alreadyRunning(winner.state)
       : new Error('Another difit server claimed the state file at the same time');
   }
+  // Only the server holding the state file restores, since restoring rewrites the list.
+  // It runs in the background: the server already answers, and lists each saved PR as
+  // restoring until its turn.
+  void restoreSessions();
 
   let stopping = false;
-  const shutDown = () => {
+  const shutDown = async () => {
     if (stopping) {
       return;
     }
     stopping = true;
+    // Wait for in-flight and queued saves to complete, up to the timeout
+    const completed = await prList.flush(SHUTDOWN_FLUSH_TIMEOUT_MS);
+    if (!completed) {
+      // The flush timed out. Remove our own temp file; any in-flight save will fail to
+      // rename, but prs.json remains valid JSON (the save wrote to the temp file, not to it).
+      await prList.discardTempFile();
+    }
     releaseServerState(state);
     server.closeAllConnections();
     server.close();
     process.exit(0);
   };
   for (const signal of SHUTDOWN_SIGNALS) {
-    process.on(signal, shutDown);
+    process.on(signal, () => void shutDown());
   }
   return state;
 }
@@ -150,13 +181,19 @@ export function createServeCommand(): Command {
     .option('--host <host>', 'host address to bind: localhost or 127.0.0.1')
     .option('--no-open', 'do not open the list of PRs in the browser')
     .option('--background', 'start the server detached and print its JSON info once it is ready')
-    .action(async (opts: ListenOptions & { open: boolean; background?: boolean }) => {
+    .option(
+      '--prs <path>',
+      'JSON file that keeps the open PRs across restarts (default: ~/.difit/prs.json)',
+    )
+    .action(async (opts: ServeOptions & { open: boolean; background?: boolean }) => {
       try {
+        // Resolved here, so a background child, which may run elsewhere, gets the same file.
+        const options = { ...opts, prs: opts.prs === undefined ? undefined : resolve(opts.prs) };
         if (opts.background) {
-          console.log(JSON.stringify(await spawnBackgroundChild(serveArgs(opts))));
+          console.log(JSON.stringify(await spawnBackgroundChild(serveArgs(options))));
           return;
         }
-        const state = await serve(opts);
+        const state = await serve(options);
         const url = serverBaseUrl(state);
         if (process.env[BACKGROUND_CHILD_ENV] === '1') {
           emitBackgroundHandshake({ port: state.port, url, pid: state.pid });

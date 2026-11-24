@@ -112,9 +112,11 @@ difit serve --background   # start it detached; prints {"port","url","pid"} once
 difit stop                 # stop it
 ```
 
-`serve` accepts `--port` (default 4966, +1 while occupied), `--host` (`localhost` or `127.0.0.1` only, because it runs `gh` with your credentials), and `--no-open`. It records where it runs in `~/.difit/server.json` (or `$DIFIT_CONFIG_DIR/server.json`); only one server runs at a time. `difit stop` signals the server only after it confirms, through `/api/server-info`, that the recorded process is that difit server, and it removes a stale file without signalling anything. Comments live in the server's memory, so stopping it drops them (the browser keeps its own copy).
+`serve` accepts `--port` (default 4966, +1 while occupied), `--host` (`localhost` or `127.0.0.1` only, because it runs `gh` with your credentials), `--prs <path>`, and `--no-open`. It records where it runs in `~/.difit/server.json` (or `$DIFIT_CONFIG_DIR/server.json`); only one server runs at a time. `difit stop` signals the server only after it confirms, through `/api/server-info`, that the recorded process is that difit server, and it removes a stale file without signalling anything. Comments live in the server's memory, so stopping it drops them (the browser keeps its own copy).
 
-Tools can add a PR without the CLI by sending `POST /api/sessions` with `{"prUrl": "...", "commentImports": [...], "clean": false}`; the response holds the page's `url`.
+The server saves the PRs it has open to `~/.difit/prs.json` (or `$DIFIT_CONFIG_DIR/prs.json`, or the file given with `--prs`) and reopens them when it starts again, fetching each one with `gh`, oldest first, so the diffs are current. A PR merged or closed in the meantime is dropped from the list. A PR that `gh` cannot fetch stays in the list as failed until `difit --pr <url>` retries it or you close it. difit never overwrites a list file it cannot read: the server starts with no PRs, stops saving, and reports why under `prList.warning` in `/api/server-info`.
+
+Tools can add a PR without the CLI by sending `POST /api/sessions` with `{"prUrl": "...", "commentImports": [...], "clean": false}`; the response holds the page's `url`. `GET /api/sessions` lists the saved PRs with a `status` of `open` (with the page's `url`), `restoring`, or `failed` (with an `error`).
 
 ### Comments on a Running Server
 

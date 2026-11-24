@@ -1,6 +1,7 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 
+import type { PullRequestSummary } from '../server/multi-server.js';
 import type { CommentImport, DiffCommentPosition, DiffLineRange } from '../types/diff.js';
 
 const execFileAsync = promisify(execFile);
@@ -370,17 +371,34 @@ export async function getPrPatch(prArg: string): Promise<string> {
   }
 }
 
-export async function getPrTitle(prArg: string): Promise<string | undefined> {
+const PR_STATES: ReadonlyArray<PullRequestSummary['state']> = ['OPEN', 'CLOSED', 'MERGED'];
+
+const isPrState = (value: unknown): value is PullRequestSummary['state'] =>
+  PR_STATES.some((state) => state === value);
+
+/** The PR's title and whether it is open, merged, or closed, from one gh pr view. */
+export async function getPrSummary(prArg: string): Promise<PullRequestSummary> {
+  let output: string;
   try {
-    const output = await runGh(['pr', 'view', '--json', 'title', '--', prArg]);
-    const { title } = JSON.parse(output) as { title?: unknown };
-    return typeof title === 'string' ? title : undefined;
+    output = await runGh(['pr', 'view', '--json', 'title,state', '--', prArg]);
   } catch (error) {
-    if (error instanceof SyntaxError) {
-      throw new Error('Invalid JSON returned from gh pr view');
-    }
     throw formatGhCommandError(error);
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(output);
+  } catch {
+    throw new Error('Invalid JSON returned from gh pr view');
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    throw new Error('gh pr view returned no PR state');
+  }
+  const title: unknown = Reflect.get(parsed, 'title');
+  const state: unknown = Reflect.get(parsed, 'state');
+  if (!isPrState(state)) {
+    throw new Error(`gh pr view returned an unknown PR state: ${String(state)}`);
+  }
+  return { title: typeof title === 'string' ? title : undefined, state };
 }
 
 export function parsePrCommentImportsResponse(
