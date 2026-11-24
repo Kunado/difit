@@ -116,20 +116,28 @@ describe('flush with timeout', () => {
       const prsPath = join(await makeTempDir(), 'prs.json');
       const prList = await openPrList(prsPath);
 
-      // flush を呼ぶ（100ms のタイムアウト）
-      const flushPromise = prList.flush(100);
+      // 保存を開始（実際の書き込みが発生）
+      const savePromise = prList.add({ url: PR_A, owner: 'octo', repo: 'alpha', number: 1 });
+
+      // flush を呼ぶ（1ms のタイムアウト）
+      const flushPromise = prList.flush(1);
 
       // タイムアウトまで進める
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(1);
 
-      // flush が完了
+      // flush が完了し、false を返す
       const completed = await flushPromise;
       expect(completed).toBe(false);
 
       // タイマーが残っていない
       expect(vi.getTimerCount()).toBe(0);
-    } finally {
+
+      // タイマーをリセットする前に保存を完了させる
       vi.useRealTimers();
+      await savePromise;
+    } catch (error) {
+      vi.useRealTimers();
+      throw error;
     }
   });
 
