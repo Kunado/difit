@@ -365,7 +365,7 @@ describe('difit serve', () => {
     // The ideal test would spy on the call order of flush(), close(), and releaseServerState(),
     // but those are internal to serve()'s closure. Instead, we verify the observable behavior:
     // PRs added before shutdown are saved to prs.json, confirming flush completed.
-    const { base } = await serve();
+    await serve();
 
     // Add PRs to trigger save operations
     await runCli(['--pr', PR_A, '--no-open']);
