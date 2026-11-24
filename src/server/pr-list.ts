@@ -26,6 +26,11 @@ export interface PrList {
   add(pr: PullRequestRef): Promise<void>;
   /** Drops the PR. Resolves once the file is written. */
   remove(id: string): Promise<void>;
+  /**
+   * Waits for in-flight and queued saves to complete, up to the timeout. Resolves when all
+   * saves finish or the timeout elapses, whichever comes first.
+   */
+  flush(timeoutMs: number): Promise<void>;
 }
 
 type Access = { kind: 'writable' } | { kind: 'read-only'; warning: string };
@@ -72,6 +77,7 @@ function parseRow(row: unknown): SavedPullRequest | null {
 }
 
 async function readContents(path: string): Promise<Contents> {
+  // TODO: clean up stale temporary files
   let raw: string;
   try {
     raw = await fs.readFile(path, 'utf8');
@@ -167,6 +173,10 @@ export async function openPrList(path: string): Promise<PrList> {
     },
     remove(id) {
       return saved.delete(id) ? save() : Promise.resolve();
+    },
+    async flush(_timeoutMs) {
+      // TODO: implement flush
+      return Promise.resolve();
     },
   };
 }

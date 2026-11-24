@@ -153,6 +153,7 @@ async function serve({
       return;
     }
     stopping = true;
+    // TODO: wait for saves and clean up temp file
     releaseServerState(state);
     server.closeAllConnections();
     server.close();
