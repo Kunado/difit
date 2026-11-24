@@ -126,12 +126,15 @@ async function runCli(args: string[]): Promise<CliResult> {
 }
 
 // What the OS does on `kill -TERM <this pid>`: run the listeners this test's CLI added.
-function deliver(signal: (typeof SIGNALS)[number]): void {
+async function deliver(signal: (typeof SIGNALS)[number]): Promise<void> {
   const baseline = baselineListeners.get(signal) ?? [];
   for (const listener of process.listeners(signal)) {
     if (!baseline.includes(listener)) {
       try {
-        (listener as (signal: string) => void)(signal);
+        const result = (listener as (signal: string) => void | Promise<void>)(signal);
+        if (result instanceof Promise) {
+          await result;
+        }
       } catch (error) {
         if (!(error instanceof ExitError)) {
           throw error;
@@ -239,7 +242,7 @@ beforeEach(async () => {
     }
     kills.push({ pid, signal });
     if (pid === process.pid && signal === 'SIGTERM') {
-      deliver('SIGTERM');
+      void deliver('SIGTERM');
     }
     return true;
   });
@@ -260,7 +263,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  deliver('SIGTERM');
+  await deliver('SIGTERM');
   for (const signal of SIGNALS) {
     const baseline = baselineListeners.get(signal) ?? [];
     for (const listener of process.listeners(signal)) {
@@ -351,7 +354,9 @@ describe('difit serve', () => {
   it('removes its state file and stops listening on SIGTERM', async () => {
     const { base } = await serve();
 
-    deliver('SIGTERM');
+    await deliver('SIGTERM');
+    // shutDown is async; wait a bit for it to complete
+    await new Promise((resolve) => setTimeout(resolve, 100));
 
     await expect(readFile(statePath(), 'utf8')).rejects.toThrow(/ENOENT/);
     await expect(fetch(`${base}/api/server-info`)).rejects.toThrow();

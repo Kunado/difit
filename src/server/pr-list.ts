@@ -27,10 +27,15 @@ export interface PrList {
   /** Drops the PR. Resolves once the file is written. */
   remove(id: string): Promise<void>;
   /**
-   * Waits for in-flight and queued saves to complete, up to the timeout. Resolves when all
-   * saves finish or the timeout elapses, whichever comes first.
+   * Waits for in-flight and queued saves to complete, up to the timeout. Returns true if all
+   * saves finished, false if the timeout elapsed.
    */
-  flush(timeoutMs: number): Promise<void>;
+  flush(timeoutMs: number): Promise<boolean>;
+  /**
+   * Removes the temporary file for this process, if it exists. Called when flush times out
+   * and the process is about to exit.
+   */
+  discardTempFile(): Promise<void>;
 }
 
 type Access = { kind: 'writable' } | { kind: 'read-only'; warning: string };
@@ -214,21 +219,18 @@ export async function openPrList(path: string): Promise<PrList> {
     },
     async flush(timeoutMs) {
       if (access.kind === 'read-only') {
-        return;
+        return true;
       }
-      const deadline = Date.now() + timeoutMs;
       // Wait for in-flight and queued saves, up to the timeout
-      await Promise.race([
-        lastSave,
-        new Promise<void>((resolve) => {
-          const remaining = deadline - Date.now();
-          if (remaining > 0) {
-            setTimeout(resolve, remaining);
-          } else {
-            resolve();
-          }
-        }),
+      const completed = await Promise.race([
+        lastSave.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
       ]);
+      return completed;
+    },
+    async discardTempFile() {
+      const tmpPath = `${path}.${process.pid}.tmp`;
+      await fs.rm(tmpPath, { force: true }).catch(() => {});
     },
   };
 }

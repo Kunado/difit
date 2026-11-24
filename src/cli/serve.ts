@@ -155,13 +155,11 @@ async function serve({
     }
     stopping = true;
     // Wait for in-flight and queued saves to complete, up to the timeout
-    const flushStart = Date.now();
-    await prList.flush(SHUTDOWN_FLUSH_TIMEOUT_MS);
-    const elapsed = Date.now() - flushStart;
-    // If the flush timed out, remove our own temp file
-    if (elapsed >= SHUTDOWN_FLUSH_TIMEOUT_MS) {
-      const tmpPath = `${prList.path}.${process.pid}.tmp`;
-      await import('fs/promises').then((fs) => fs.rm(tmpPath, { force: true })).catch(() => {});
+    const completed = await prList.flush(SHUTDOWN_FLUSH_TIMEOUT_MS);
+    if (!completed) {
+      // The flush timed out. Remove our own temp file; any in-flight save will fail to
+      // rename, but prs.json remains valid JSON (the save wrote to the temp file, not to it).
+      await prList.discardTempFile();
     }
     releaseServerState(state);
     server.closeAllConnections();

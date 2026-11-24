@@ -22,7 +22,7 @@ async function makeTempDir(): Promise<string> {
 const PR_A = 'https://github.com/octo/alpha/pull/1';
 
 describe('flush with timeout', () => {
-  it('waits for in-flight and queued saves to complete before resolving', async () => {
+  it('waits for in-flight and queued saves to complete and returns true', async () => {
     vi.useFakeTimers();
     try {
       const prsPath = join(await makeTempDir(), 'prs.json');
@@ -37,30 +37,69 @@ describe('flush with timeout', () => {
       // 保存を待つ
       await save1;
 
-      // flush が完了する
-      await flushPromise;
+      // flush が完了し、true を返す
+      const completed = await flushPromise;
+      expect(completed).toBe(true);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('resolves after timeout if saves take too long, leaving temp file', async () => {
+  it('returns false after timeout if saves take too long', async () => {
     vi.useFakeTimers();
     try {
       const prsPath = join(await makeTempDir(), 'prs.json');
       const prList = await openPrList(prsPath);
 
-      // flush を呼ぶ（100ms のタイムアウト）
-      const flushPromise = prList.flush(100);
+      // 保存を開始（実際の書き込みが発生）
+      const savePromise = prList.add({ url: PR_A, owner: 'octo', repo: 'alpha', number: 1 });
+
+      // flush を呼ぶ（1ms のタイムアウト、保存が終わる前）
+      const flushPromise = prList.flush(1);
 
       // タイムアウトまで進める
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(1);
 
-      // タイムアウトで完了する
-      await flushPromise;
-    } finally {
+      // タイムアウトで完了し、false を返す
+      const completed = await flushPromise;
+      expect(completed).toBe(false);
+
+      // タイマーをリセットする前に保存を完了させる
       vi.useRealTimers();
+      await savePromise;
+    } catch (error) {
+      vi.useRealTimers();
+      throw error;
     }
+  });
+});
+
+describe('discardTempFile', () => {
+  it('removes the temp file for this process', async () => {
+    const dir = await makeTempDir();
+    const prsPath = join(dir, 'prs.json');
+    // prs.json を作成
+    await writeFile(prsPath, JSON.stringify({ version: 1, pullRequests: [] }));
+    const prList = await openPrList(prsPath);
+
+    // 一時ファイルを作成
+    const tmpPath = `${prsPath}.${process.pid}.tmp`;
+    await writeFile(tmpPath, 'temporary data');
+
+    // discardTempFile を呼ぶ
+    await prList.discardTempFile();
+
+    // 一時ファイルが消えている
+    const files = await readdir(dir);
+    expect(files).toEqual(['prs.json']);
+  });
+
+  it('does not fail if temp file does not exist', async () => {
+    const prsPath = join(await makeTempDir(), 'prs.json');
+    const prList = await openPrList(prsPath);
+
+    // 一時ファイルがない状態で呼ぶ
+    await prList.discardTempFile();
   });
 });
 
