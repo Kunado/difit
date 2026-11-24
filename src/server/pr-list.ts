@@ -55,6 +55,20 @@ const isErrorCode = (error: unknown, code: string) =>
 
 const describeError = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
+const isProcessAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // ESRCH: process does not exist
+    // EPERM: process exists but we don't have permission - treat as alive
+    if (isErrorCode(error, 'ESRCH')) {
+      return false;
+    }
+    return true;
+  }
+};
+
 const readOnly = (problem: string): Contents => ({
   access: {
     kind: 'read-only',
@@ -77,7 +91,29 @@ function parseRow(row: unknown): SavedPullRequest | null {
 }
 
 async function readContents(path: string): Promise<Contents> {
-  // TODO: clean up stale temporary files
+  // Clean up stale temporary files from previous servers that didn't shut down cleanly.
+  // Pattern: <basename>.<pid>.tmp where pid is numeric
+  const dir = dirname(path);
+  const basename = path.split('/').pop() ?? '';
+  const tmpPattern = new RegExp(`^${basename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.(\\d+)\\.tmp$`);
+  try {
+    const files = await fs.readdir(dir);
+    for (const file of files) {
+      const match = tmpPattern.exec(file);
+      if (match && match[1]) {
+        const pid = parseInt(match[1], 10);
+        // Skip our own pid's temp file (we might be saving right now)
+        if (pid !== process.pid && !isProcessAlive(pid)) {
+          await fs.rm(join(dir, file), { force: true }).catch(() => {
+            // Cleanup failure does not prevent startup
+          });
+        }
+      }
+    }
+  } catch {
+    // If we can't read the directory or clean up, continue with startup anyway
+  }
+
   let raw: string;
   try {
     raw = await fs.readFile(path, 'utf8');
@@ -174,9 +210,23 @@ export async function openPrList(path: string): Promise<PrList> {
     remove(id) {
       return saved.delete(id) ? save() : Promise.resolve();
     },
-    async flush(_timeoutMs) {
-      // TODO: implement flush
-      return Promise.resolve();
+    async flush(timeoutMs) {
+      if (access.kind === 'read-only') {
+        return;
+      }
+      const deadline = Date.now() + timeoutMs;
+      // Wait for in-flight and queued saves, up to the timeout
+      await Promise.race([
+        lastSave,
+        new Promise<void>((resolve) => {
+          const remaining = deadline - Date.now();
+          if (remaining > 0) {
+            setTimeout(resolve, remaining);
+          } else {
+            resolve();
+          }
+        }),
+      ]);
     },
   };
 }

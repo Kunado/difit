@@ -41,6 +41,7 @@ interface ServeOptions extends ListenOptions {
 }
 
 const STOP_TIMEOUT_MS = 10_000;
+const SHUTDOWN_FLUSH_TIMEOUT_MS = 3_000;
 const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
 // A PR as a browser shows it: https://<host>/<owner>/<repo>/pull/<number>, optionally
 // followed by a page under it (/files), a trailing slash, a query, or a fragment.
@@ -148,19 +149,29 @@ async function serve({
   void restoreSessions();
 
   let stopping = false;
-  const shutDown = () => {
+  const shutDown = async () => {
     if (stopping) {
       return;
     }
     stopping = true;
-    // TODO: wait for saves and clean up temp file
+    // Wait for in-flight and queued saves to complete, up to the timeout
+    const flushStart = Date.now();
+    await prList.flush(SHUTDOWN_FLUSH_TIMEOUT_MS);
+    const elapsed = Date.now() - flushStart;
+    // If the flush timed out, remove our own temp file
+    if (elapsed >= SHUTDOWN_FLUSH_TIMEOUT_MS) {
+      const tmpPath = `${prList.path}.${process.pid}.tmp`;
+      await import('fs/promises')
+        .then((fs) => fs.rm(tmpPath, { force: true }))
+        .catch(() => {});
+    }
     releaseServerState(state);
     server.closeAllConnections();
     server.close();
     process.exit(0);
   };
   for (const signal of SHUTDOWN_SIGNALS) {
-    process.on(signal, shutDown);
+    process.on(signal, () => void shutDown());
   }
   return state;
 }
