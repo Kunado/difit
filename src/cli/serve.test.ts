@@ -360,6 +360,25 @@ describe('difit serve', () => {
     await expect(fetch(`${base}/api/server-info`)).rejects.toThrow();
   });
 
+  it('completes flush before closing the server on shutdown', async () => {
+    // Verifies that shutDown waits for flush to complete before calling server.close().
+    // The ideal test would spy on the call order of flush(), close(), and releaseServerState(),
+    // but those are internal to serve()'s closure. Instead, we verify the observable behavior:
+    // PRs added before shutdown are saved to prs.json, confirming flush completed.
+    const { base } = await serve();
+
+    // Add PRs to trigger save operations
+    await runCli(['--pr', PR_A, '--no-open']);
+    await runCli(['--pr', PR_B, '--no-open']);
+
+    // Shutdown and verify the PRs were flushed to disk
+    await deliver('SIGTERM');
+
+    // After shutdown, prs.json should contain both PRs (flush completed before process exit)
+    const urls = await savedUrls(prsPath());
+    expect(urls).toEqual([PR_A, PR_B]);
+  });
+
   it('starts in the background and prints the child handshake', async () => {
     const result = await runCli(['serve', '--background', '--port', '0']);
 
