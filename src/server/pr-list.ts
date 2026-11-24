@@ -95,7 +95,9 @@ async function readContents(path: string): Promise<Contents> {
   // Pattern: <basename>.<pid>.tmp where pid is numeric
   const dir = dirname(path);
   const basename = path.split('/').pop() ?? '';
-  const tmpPattern = new RegExp(`^${basename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.(\\d+)\\.tmp$`);
+  const tmpPattern = new RegExp(
+    `^${basename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.(\\d+)\\.tmp$`,
+  );
   try {
     const files = await fs.readdir(dir);
     for (const file of files) {

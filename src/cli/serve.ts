@@ -161,9 +161,7 @@ async function serve({
     // If the flush timed out, remove our own temp file
     if (elapsed >= SHUTDOWN_FLUSH_TIMEOUT_MS) {
       const tmpPath = `${prList.path}.${process.pid}.tmp`;
-      await import('fs/promises')
-        .then((fs) => fs.rm(tmpPath, { force: true }))
-        .catch(() => {});
+      await import('fs/promises').then((fs) => fs.rm(tmpPath, { force: true })).catch(() => {});
     }
     releaseServerState(state);
     server.closeAllConnections();
