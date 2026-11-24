@@ -1453,9 +1453,7 @@ describe('startMultiServer', () => {
     const github = fakeGitHub();
     const prList = await openPrList(join(await makeTempDir(), 'prs.json'));
 
-    await expect(startMultiServer({ github, prList, host: '0.0.0.0' })).rejects.toThrow(
-      /loopback/,
-    );
+    await expect(startMultiServer({ github, prList, host: '0.0.0.0' })).rejects.toThrow(/loopback/);
 
     const started = await startMultiServer({
       github,

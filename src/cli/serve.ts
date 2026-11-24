@@ -118,7 +118,11 @@ async function serve({
   if (warning) {
     console.warn(`Warning: ${warning}`);
   }
-  const { port: listeningPort, server, restoreSessions } = await startMultiServer({
+  const {
+    port: listeningPort,
+    server,
+    restoreSessions,
+  } = await startMultiServer({
     github,
     prList,
     preferredPort: port,
