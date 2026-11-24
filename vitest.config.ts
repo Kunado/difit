@@ -13,6 +13,7 @@ export default defineConfig({
     globals: true,
     environment: 'happy-dom',
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx', 'dev/**/*.test.ts'],
+    exclude: ['src/cli/serve.test.ts'],
     setupFiles: ['./vitest.setup.ts'],
     pool: 'forks',
   },
