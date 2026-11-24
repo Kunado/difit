@@ -3,7 +3,7 @@
 //   { "version": 1, "pullRequests": [{ "url": "https://github.com/...", "addedAt": "<ISO>" }] }
 // Rows come oldest first. A file it cannot read as that shape is never overwritten.
 import { promises as fs } from 'fs';
-import { dirname, join } from 'path';
+import { basename, dirname, join } from 'path';
 
 import { identifySession, parsePullRequestUrl, type PullRequestRef } from './pull-request-url.js';
 import { getUserConfigPath } from './user-config.js';
@@ -99,9 +99,9 @@ async function readContents(path: string): Promise<Contents> {
   // Clean up stale temporary files from previous servers that didn't shut down cleanly.
   // Pattern: <basename>.<pid>.tmp where pid is numeric
   const dir = dirname(path);
-  const basename = path.split('/').pop() ?? '';
+  const filename = basename(path);
   const tmpPattern = new RegExp(
-    `^${basename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.(\\d+)\\.tmp$`,
+    `^${filename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.(\\d+)\\.tmp$`,
   );
   try {
     const files = await fs.readdir(dir);
