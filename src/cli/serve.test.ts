@@ -613,7 +613,10 @@ describe('the saved PR list', () => {
     await runCli(['--pr', PR_B, '--no-open']);
     const [a] = await listSessions(base);
 
-    const close = await fetch(`${base}/api/sessions/${a?.id}`, { method: 'DELETE' });
+    const close = await fetch(`${base}/api/sessions/${a?.id}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+    });
 
     expect(close.status).toBe(200);
     expect(await savedUrls(prsPath())).toEqual([PR_B]);
