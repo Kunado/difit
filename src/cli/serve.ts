@@ -168,7 +168,7 @@ async function serve({
     process.exit(0);
   };
   for (const signal of SHUTDOWN_SIGNALS) {
-    process.on(signal, () => void shutDown());
+    process.on(signal, () => shutDown());
   }
   return state;
 }

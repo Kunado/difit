@@ -130,14 +130,14 @@ async function deliver(signal: (typeof SIGNALS)[number]): Promise<void> {
   const baseline = baselineListeners.get(signal) ?? [];
   for (const listener of process.listeners(signal)) {
     if (!baseline.includes(listener)) {
-      try {
-        const result = (listener as (signal: string) => void | Promise<void>)(signal);
-        if (result instanceof Promise) {
+      const result = (listener as (signal: string) => void | Promise<void>)(signal);
+      if (result instanceof Promise) {
+        try {
           await result;
-        }
-      } catch (error) {
-        if (!(error instanceof ExitError)) {
-          throw error;
+        } catch (error) {
+          if (!(error instanceof ExitError)) {
+            throw error;
+          }
         }
       }
     }
@@ -355,8 +355,6 @@ describe('difit serve', () => {
     const { base } = await serve();
 
     await deliver('SIGTERM');
-    // shutDown is async; wait a bit for it to complete
-    await new Promise((resolve) => setTimeout(resolve, 100));
 
     await expect(readFile(statePath(), 'utf8')).rejects.toThrow(/ENOENT/);
     await expect(fetch(`${base}/api/server-info`)).rejects.toThrow();
