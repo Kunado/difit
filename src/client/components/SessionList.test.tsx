@@ -44,9 +44,18 @@ const jsonResponse = (body: unknown, status = 200) =>
     headers: { 'Content-Type': 'application/json' },
   });
 
+// A saved PR the server is still reopening or could not reopen: it has no page yet.
+interface PendingSession {
+  id: string;
+  status: 'restoring' | 'failed';
+  prUrl: string;
+  label: string;
+  error?: string;
+}
+
 // Answers like the multi-session server: GET /api/sessions lists `open`, and
 // DELETE /api/sessions/:id removes the session from it.
-function fakeServer(initial: FakeSession[]) {
+function fakeServer(initial: Array<FakeSession | PendingSession>) {
   const open = [...initial];
   const requests: RecordedRequest[] = [];
   const state = { failDeletes: false };
@@ -113,6 +122,30 @@ describe('SessionList', () => {
       expect(time).not.toBeNull();
       expect(time).toHaveTextContent(/\S/);
     }
+  });
+
+  it('keeps listing the open PRs while saved ones are being restored or failed', async () => {
+    fakeServer([
+      ALPHA,
+      {
+        id: 'cccccccccccccccc',
+        status: 'restoring',
+        prUrl: 'https://github.com/octo/gamma/pull/3',
+        label: 'octo/gamma#3',
+      },
+      {
+        id: 'dddddddddddddddd',
+        status: 'failed',
+        prUrl: 'https://github.com/octo/delta/pull/4',
+        label: 'octo/delta#4',
+        error: 'Could not fetch the pull request with gh.',
+      },
+    ]);
+
+    render(<SessionList />);
+
+    expect(await screen.findByRole('link', { name: /octo\/alpha#1/ })).toBeInTheDocument();
+    expect(screen.queryByText(/Could not load/)).not.toBeInTheDocument();
   });
 
   it('links each PR to its review page', async () => {

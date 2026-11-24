@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'fs/promises';
 import { request as httpRequest, type Server } from 'http';
 import { type AddressInfo } from 'net';
 import { tmpdir } from 'os';
@@ -8,11 +8,17 @@ import { fetch } from 'undici';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import pkg from '../../package.json' with { type: 'json' };
-import { getPrCommentImports, getPrPatch, getPrTitle } from '../cli/github.js';
+import { getPrCommentImports, getPrPatch, getPrSummary } from '../cli/github.js';
 import { type CommentImport } from '../types/diff.js';
 import { SESSION_PATH_PATTERN } from '../utils/sessionPath.js';
 
-import { createMultiSessionApp, type PullRequestSource, startMultiServer } from './multi-server.js';
+import {
+  createMultiSessionApp,
+  type PullRequestSource,
+  type PullRequestSummary,
+  startMultiServer,
+} from './multi-server.js';
+import { openPrList } from './pr-list.js';
 
 const { ghMock } = vi.hoisted(() => ({ ghMock: vi.fn() }));
 
@@ -47,6 +53,7 @@ const isoNow = '2024-01-01T00:00:00Z';
 
 const openServers: Server[] = [];
 const openStreams: AbortController[] = [];
+const tempDirs: string[] = [];
 
 afterEach(async () => {
   for (const controller of openStreams.splice(0)) {
@@ -61,9 +68,16 @@ afterEach(async () => {
         }),
     ),
   );
+  await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   vi.clearAllMocks();
   vi.restoreAllMocks();
 });
+
+async function makeTempDir(): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), 'difit-prs-'));
+  tempDirs.push(dir);
+  return dir;
+}
 
 // "https://github.com/octo/alpha/pull/1" -> "alpha.ts", so each PR has its own file.
 const fileOf = (prUrl: string) => `${new URL(prUrl).pathname.split('/')[2]}.ts`;
@@ -94,7 +108,12 @@ function fakeGitHub() {
   return {
     getPrPatch: vi.fn(async (prUrl: string) => patchFor(fileOf(prUrl))),
     getPrCommentImports: vi.fn(async (_prUrl: string): Promise<CommentImport[]> => []),
-    getPrTitle: vi.fn(async (prUrl: string): Promise<string | undefined> => `Title of ${prUrl}`),
+    getPrSummary: vi.fn(
+      async (prUrl: string): Promise<PullRequestSummary> => ({
+        title: `Title of ${prUrl}`,
+        state: 'OPEN',
+      }),
+    ),
   } satisfies PullRequestSource;
 }
 
@@ -110,16 +129,44 @@ function holdPatch(github: ReturnType<typeof fakeGitHub>) {
   return () => release();
 }
 
+// Holds the next gh pr view until the returned function is called with the PR's state.
+function holdSummary(github: ReturnType<typeof fakeGitHub>) {
+  let release = (_state: PullRequestSummary['state']) => {};
+  github.getPrSummary.mockImplementationOnce(
+    (prUrl: string) =>
+      new Promise<PullRequestSummary>((resolve) => {
+        release = (state) => resolve({ title: `Title of ${prUrl}`, state });
+      }),
+  );
+  return (state: PullRequestSummary['state'] = 'OPEN') => release(state);
+}
+
+// Each app saves its PR list to a prs.json of its own unless the test names one.
 async function startApp(
   github: PullRequestSource = fakeGitHub(),
-  options: { clientDir?: string } = {},
+  options: { clientDir?: string; prsPath?: string } = {},
 ) {
-  const app = createMultiSessionApp({ github, ...options });
+  const { prsPath = join(await makeTempDir(), 'prs.json'), ...appOptions } = options;
+  const prList = await openPrList(prsPath);
+  const { app, restoreSessions } = createMultiSessionApp({ github, prList, ...appOptions });
   const server = app.listen(0, '127.0.0.1');
   openServers.push(server);
   await new Promise<void>((resolve) => server.once('listening', () => resolve()));
   const { port } = server.address() as AddressInfo;
-  return { base: `http://127.0.0.1:${port}`, port, github };
+  return { base: `http://127.0.0.1:${port}`, port, github, prsPath, restoreSessions };
+}
+
+const readPrsFile = async (prsPath: string) => JSON.parse(await readFile(prsPath, 'utf8'));
+
+const savedUrls = async (prsPath: string) =>
+  ((await readPrsFile(prsPath)) as { pullRequests: Array<{ url: string }> }).pullRequests.map(
+    (row) => row.url,
+  );
+
+async function writePrsFile(rows: unknown[]): Promise<string> {
+  const prsPath = join(await makeTempDir(), 'prs.json');
+  await writeFile(prsPath, JSON.stringify({ version: 1, pullRequests: rows }));
+  return prsPath;
 }
 
 const jsonHeaders = { 'Content-Type': 'application/json' };
@@ -244,6 +291,7 @@ describe('POST /api/sessions', () => {
     const body = (await response.json()) as Record<string, string>;
     expect(body).toEqual({
       id: expect.stringMatching(/^[a-z0-9-]+$/),
+      status: 'open',
       url: `/s/${body.id}/`,
       prUrl: PR_A,
       label: 'octo/alpha#1',
@@ -429,7 +477,7 @@ describe('POST /api/sessions', () => {
     const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const github = fakeGitHub();
     github.getPrCommentImports.mockRejectedValue(new Error('GraphQL: rate limited'));
-    github.getPrTitle.mockRejectedValue(new Error('gh pr view failed'));
+    github.getPrSummary.mockRejectedValue(new Error('gh pr view failed'));
     const { base } = await startApp(github);
 
     const response = await createSession(base, {
@@ -478,7 +526,7 @@ describe('POST /api/sessions', () => {
 });
 
 describe('a gh run that never exits', () => {
-  const ghSource: PullRequestSource = { getPrPatch, getPrCommentImports, getPrTitle };
+  const ghSource: PullRequestSource = { getPrPatch, getPrCommentImports, getPrSummary };
 
   // Like execFile, a run fails once its options.timeout elapses, which is when the returned
   // function is called. A run without a timeout hangs.
@@ -515,7 +563,7 @@ describe('a gh run that never exits', () => {
       args[0] === 'api'
         ? JSON.stringify({ data: null })
         : args[1] === 'view'
-          ? JSON.stringify({ title: 'Alpha' })
+          ? JSON.stringify({ title: 'Alpha', state: 'OPEN' })
           : patchFor('alpha.ts');
     return Promise.resolve({ stdout, stderr: '' });
   }
@@ -798,8 +846,8 @@ describe('clean', () => {
 });
 
 describe('GET /api/server-info', () => {
-  it('identifies a multi-mode difit server', async () => {
-    const { base } = await startApp();
+  it('identifies a multi-mode difit server and where it saves the PR list', async () => {
+    const { base, prsPath } = await startApp();
 
     expect(await getJson(`${base}/api/server-info`)).toEqual({
       app: 'difit',
@@ -807,7 +855,316 @@ describe('GET /api/server-info', () => {
       version: pkg.version,
       pid: process.pid,
       startedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+      prList: { path: prsPath },
     });
+  });
+});
+
+describe('the saved PR list', () => {
+  it('saves each opened PR before answering, oldest first, and drops a closed one before answering', async () => {
+    const { base, prsPath } = await startApp();
+
+    const b = await openPr(base, PR_B);
+    const file = await readPrsFile(prsPath);
+    expect(file).toEqual({
+      version: 1,
+      pullRequests: [{ url: PR_B, addedAt: expect.any(String) }],
+    });
+    const { addedAt } = file.pullRequests[0];
+    expect(new Date(addedAt).toISOString()).toBe(addedAt);
+
+    await openPr(base, PR_A);
+    expect(await savedUrls(prsPath)).toEqual([PR_B, PR_A]);
+
+    // Asking again for an open PR changes nothing.
+    expect((await createSession(base, { prUrl: PR_A })).status).toBe(200);
+    expect(await savedUrls(prsPath)).toEqual([PR_B, PR_A]);
+
+    expect((await deleteSession(base, b.id)).status).toBe(200);
+    expect(await savedUrls(prsPath)).toEqual([PR_A]);
+  });
+
+  it('does not save a PR that could not be opened', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const github = fakeGitHub();
+    github.getPrPatch.mockRejectedValueOnce(new Error('gh pr diff failed'));
+    const { base, prsPath } = await startApp(github);
+
+    expect((await createSession(base, { prUrl: PR_A })).status).toBe(502);
+
+    await expect(readFile(prsPath, 'utf8')).rejects.toThrow(/ENOENT/);
+    expect(await listSessions(base)).toEqual([]);
+  });
+
+  it('writes concurrent opens and closes one at a time, so the file ends with every change', async () => {
+    const { base, prsPath } = await startApp();
+    const prUrls = [1, 2, 3, 4, 5, 6].map((n) => `https://github.com/octo/repo${n}/pull/${n}`);
+
+    const opened = await Promise.all(prUrls.map((prUrl) => openPr(base, prUrl)));
+    expect(new Set(await savedUrls(prsPath))).toEqual(new Set(prUrls));
+
+    const closes = await Promise.all(opened.slice(0, 4).map(({ id }) => deleteSession(base, id)));
+    expect(closes.map((response) => response.status)).toEqual([200, 200, 200, 200]);
+    expect(new Set(await savedUrls(prsPath))).toEqual(new Set(prUrls.slice(4)));
+    // No temporary file is left behind next to the list.
+    expect(await readdir(join(prsPath, '..'))).toEqual(['prs.json']);
+  });
+});
+
+describe('a saved PR list the server cannot use', () => {
+  it.each([
+    ['invalid JSON', '{"version": 1, "pullRequests": ['],
+    ['another version', '{"version": 2, "pullRequests": []}'],
+    ['another shape', '[{"url": "https://github.com/octo/alpha/pull/1"}]'],
+  ])(
+    'starts empty, warns in server-info, and never overwrites a file with %s',
+    async (_kind, content) => {
+      const prsPath = join(await makeTempDir(), 'prs.json');
+      await writeFile(prsPath, content);
+      const { base, restoreSessions } = await startApp(fakeGitHub(), { prsPath });
+
+      await restoreSessions();
+      expect(await listSessions(base)).toEqual([]);
+      const info = await getJson(`${base}/api/server-info`);
+      expect(info.prList).toEqual({ path: prsPath, warning: expect.stringContaining(prsPath) });
+
+      // PRs still open; they are just not saved.
+      const a = await openPr(base, PR_A);
+      expect((await deleteSession(base, a.id)).status).toBe(200);
+      await openPr(base, PR_B);
+      expect(await readFile(prsPath, 'utf8')).toBe(content);
+    },
+  );
+
+  it('starts empty and warns when the file cannot be read', async () => {
+    const prsPath = join(await makeTempDir(), 'prs.json');
+    await mkdir(prsPath);
+    const { base } = await startApp(fakeGitHub(), { prsPath });
+
+    await openPr(base, PR_A);
+
+    const info = await getJson(`${base}/api/server-info`);
+    expect(info.prList).toEqual({ path: prsPath, warning: expect.stringContaining(prsPath) });
+    expect(await readdir(prsPath)).toEqual([]);
+  });
+});
+
+describe('restoring the saved PR list', () => {
+  const PR_C = 'https://github.com/octo/gamma/pull/3';
+  const GH_FAILURE =
+    'Could not fetch the pull request with gh. Check that it exists and that gh is installed and logged in (gh auth status). The server log has the details.';
+  const row = (url: string, day: number) => ({
+    url,
+    addedAt: `2026-01-0${day}T00:00:00.000Z`,
+  });
+
+  const statuses = async (base: string) =>
+    ((await listSessions(base)) as Array<{ prUrl: string; status: string }>).map(
+      ({ prUrl, status }) => [prUrl, status],
+    );
+
+  it('lists saved PRs as restoring by when they were added, then opens them one by one', async () => {
+    const unreadable = { url: 'https://example.com/octo/alpha/pull/1', addedAt: 'yesterday' };
+    const prsPath = await writePrsFile([
+      row(PR_B, 2),
+      unreadable,
+      row(PR_A, 1),
+      // The same PR as PR_A in another case: one session, so the later row goes.
+      row('https://github.com/Octo/Alpha/pull/1', 3),
+    ]);
+    const github = fakeGitHub();
+    const { base, restoreSessions } = await startApp(github, { prsPath });
+
+    expect(await listSessions(base)).toEqual([
+      { id: expect.any(String), status: 'restoring', prUrl: PR_A, label: 'octo/alpha#1' },
+      { id: expect.any(String), status: 'restoring', prUrl: PR_B, label: 'octo/beta#2' },
+    ]);
+    expect(github.getPrSummary).not.toHaveBeenCalled();
+
+    await restoreSessions();
+
+    const sessions = (await listSessions(base)) as Array<{ url: string; title: string }>;
+    expect(await statuses(base)).toEqual([
+      [PR_A, 'open'],
+      [PR_B, 'open'],
+    ]);
+    expect(sessions.map((session) => session.title)).toEqual([
+      `Title of ${PR_A}`,
+      `Title of ${PR_B}`,
+    ]);
+    // One gh pr view per PR gives both its state and its title.
+    expect(github.getPrSummary.mock.calls).toEqual([[PR_A], [PR_B]]);
+    const diff = await getJson(`${base}${sessions[0]?.url}api/diff`);
+    expect(diff.files.map((file: { path: string }) => file.path)).toEqual(['alpha.ts']);
+    // The rows the server cannot open stay in the file; the duplicate goes on the next save.
+    await openPr(base, PR_C);
+    expect((await readPrsFile(prsPath)).pullRequests).toEqual([
+      row(PR_A, 1),
+      row(PR_B, 2),
+      { url: PR_C, addedAt: expect.any(String) },
+      unreadable,
+    ]);
+  });
+
+  it('drops merged and closed PRs from the list and the file without opening them', async () => {
+    const prsPath = await writePrsFile([row(PR_A, 1), row(PR_B, 2), row(PR_C, 3)]);
+    const github = fakeGitHub();
+    const states: Record<string, PullRequestSummary['state']> = {
+      [PR_B]: 'MERGED',
+      [PR_C]: 'CLOSED',
+    };
+    github.getPrSummary.mockImplementation(async (prUrl) => ({
+      title: undefined,
+      state: states[prUrl] ?? 'OPEN',
+    }));
+    const { base, restoreSessions } = await startApp(github, { prsPath });
+
+    await restoreSessions();
+
+    expect(await statuses(base)).toEqual([[PR_A, 'open']]);
+    expect(await savedUrls(prsPath)).toEqual([PR_A]);
+    expect(github.getPrPatch.mock.calls).toEqual([[PR_A]]);
+  });
+
+  it('keeps a PR gh could not fetch as failed, in the list and the file, and retries it on POST', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const prsPath = await writePrsFile([row(PR_A, 1), row(PR_B, 2), row(PR_C, 3)]);
+    const github = fakeGitHub();
+    github.getPrSummary.mockImplementation(async (prUrl) => {
+      if (prUrl === PR_B) {
+        throw new Error('HTTP 401: Bad credentials ghp_abcdefghijklmnopqrstuvwxyz0123456789');
+      }
+      return { title: undefined, state: 'OPEN' };
+    });
+    github.getPrPatch.mockImplementation(async (prUrl) => {
+      if (prUrl === PR_C) {
+        throw new Error('gh pr diff failed');
+      }
+      return patchFor(fileOf(prUrl));
+    });
+    const { base, restoreSessions } = await startApp(github, { prsPath });
+
+    await restoreSessions();
+
+    const text = await (await fetch(`${base}/api/sessions`)).text();
+    expect(text).not.toContain('ghp_');
+    const failedRow = (prUrl: string, label: string) => ({
+      id: expect.any(String),
+      status: 'failed',
+      prUrl,
+      label,
+      error: GH_FAILURE,
+    });
+    expect(JSON.parse(text).sessions.slice(1)).toEqual([
+      failedRow(PR_B, 'octo/beta#2'),
+      failedRow(PR_C, 'octo/gamma#3'),
+    ]);
+    expect(await savedUrls(prsPath)).toEqual([PR_A, PR_B, PR_C]);
+    const logged = consoleError.mock.calls.flat().join('\n');
+    expect(logged).toContain('octo/beta#2');
+    expect(logged).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz0123456789');
+
+    github.getPrSummary.mockResolvedValue({ title: undefined, state: 'OPEN' });
+    const retried = await createSession(base, { prUrl: PR_B });
+
+    expect(retried.status).toBe(201);
+    expect(await statuses(base)).toEqual([
+      [PR_A, 'open'],
+      [PR_B, 'open'],
+      [PR_C, 'failed'],
+    ]);
+    // A retry keeps the PR's place and the time it was first added.
+    expect((await readPrsFile(prsPath)).pullRequests).toEqual([
+      row(PR_A, 1),
+      row(PR_B, 2),
+      row(PR_C, 3),
+    ]);
+  });
+
+  it('lets DELETE drop a waiting or failed PR, and answers 409 for the one being restored', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const prsPath = await writePrsFile([row(PR_A, 1), row(PR_B, 2), row(PR_C, 3)]);
+    const github = fakeGitHub();
+    const releaseA = holdSummary(github);
+    github.getPrPatch.mockImplementation(async (prUrl) => {
+      if (prUrl === PR_C) {
+        throw new Error('gh pr diff failed');
+      }
+      return patchFor(fileOf(prUrl));
+    });
+    const { base, restoreSessions } = await startApp(github, { prsPath });
+    const [a, b, c] = (await listSessions(base)) as Array<{ id: string }>;
+
+    const restoring = restoreSessions();
+    await vi.waitFor(() => expect(github.getPrSummary).toHaveBeenCalledTimes(1));
+
+    expect((await deleteSession(base, a!.id)).status).toBe(409);
+    const deleteB = await deleteSession(base, b!.id);
+    expect(deleteB.status).toBe(200);
+    expect(await deleteB.json()).toEqual({ success: true, id: b!.id });
+    expect(await savedUrls(prsPath)).toEqual([PR_A, PR_C]);
+    expect(await statuses(base)).toEqual([
+      [PR_A, 'restoring'],
+      [PR_C, 'restoring'],
+    ]);
+
+    releaseA();
+    await restoring;
+
+    expect(github.getPrSummary.mock.calls).toEqual([[PR_A], [PR_C]]);
+    expect(await statuses(base)).toEqual([
+      [PR_A, 'open'],
+      [PR_C, 'failed'],
+    ]);
+    expect((await deleteSession(base, c!.id)).status).toBe(200);
+    expect(await statuses(base)).toEqual([[PR_A, 'open']]);
+    expect(await savedUrls(prsPath)).toEqual([PR_A]);
+  });
+
+  it('opens a waiting PR at once on POST instead of waiting for its turn', async () => {
+    const prsPath = await writePrsFile([row(PR_A, 1), row(PR_B, 2)]);
+    const github = fakeGitHub();
+    const releaseA = holdSummary(github);
+    const { base, restoreSessions } = await startApp(github, { prsPath });
+
+    const restoring = restoreSessions();
+    await vi.waitFor(() => expect(github.getPrSummary).toHaveBeenCalledTimes(1));
+    const b = await createSession(base, { prUrl: PR_B });
+
+    expect(b.status).toBe(201);
+    expect(await statuses(base)).toEqual([
+      [PR_A, 'restoring'],
+      [PR_B, 'open'],
+    ]);
+
+    releaseA();
+    await restoring;
+
+    expect(await statuses(base)).toEqual([
+      [PR_A, 'open'],
+      [PR_B, 'open'],
+    ]);
+    expect(github.getPrPatch.mock.calls.filter(([prUrl]) => prUrl === PR_B)).toHaveLength(1);
+    expect(await savedUrls(prsPath)).toEqual([PR_A, PR_B]);
+  });
+
+  it('opens a PR asked for by POST even when its restore finds it merged', async () => {
+    const prsPath = await writePrsFile([row(PR_A, 1)]);
+    const github = fakeGitHub();
+    const releaseA = holdSummary(github);
+    const { base, restoreSessions } = await startApp(github, { prsPath });
+
+    const restoring = restoreSessions();
+    await vi.waitFor(() => expect(github.getPrSummary).toHaveBeenCalledTimes(1));
+    const creation = createSession(base, { prUrl: PR_A });
+    // Let the POST reach the server while the restore is still asking gh.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    releaseA('MERGED');
+    await restoring;
+
+    expect((await creation).status).toBe(201);
+    expect(await statuses(base)).toEqual([[PR_A, 'open']]);
+    expect(await savedUrls(prsPath)).toEqual([PR_A]);
   });
 });
 
@@ -1086,10 +1443,18 @@ describe('review pages', () => {
 describe('startMultiServer', () => {
   it('listens on a loopback host and refuses to bind anywhere else', async () => {
     const github = fakeGitHub();
+    const prList = await openPrList(join(await makeTempDir(), 'prs.json'));
 
-    await expect(startMultiServer({ github, host: '0.0.0.0' })).rejects.toThrow(/loopback/);
+    await expect(startMultiServer({ github, prList, host: '0.0.0.0' })).rejects.toThrow(
+      /loopback/,
+    );
 
-    const started = await startMultiServer({ github, preferredPort: 9410, host: '127.0.0.1' });
+    const started = await startMultiServer({
+      github,
+      prList,
+      preferredPort: 9410,
+      host: '127.0.0.1',
+    });
     openServers.push(started.server);
     expect(started.url).toBe(`http://127.0.0.1:${started.port}`);
     expect(await getJson(`${started.url}/api/server-info`)).toMatchObject({ mode: 'multi' });

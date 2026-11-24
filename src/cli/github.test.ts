@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   getPrCommentImports,
   getPrPatch,
-  getPrTitle,
+  getPrSummary,
   parseGitHubPrUrl,
   parsePrCommentImportsResponse,
 } from './github';
@@ -507,21 +507,40 @@ describe('CLI GitHub utils', () => {
       expect(ghMock).not.toHaveBeenCalled();
     });
 
-    it('reads the PR title with gh pr view', async () => {
-      ghMock.mockResolvedValueOnce({ stdout: '{"title":"Add the sessions API"}\n', stderr: '' });
+    it('reads the PR title and state with one gh pr view', async () => {
+      ghMock.mockResolvedValueOnce({
+        stdout: '{"state":"MERGED","title":"Add the sessions API"}\n',
+        stderr: '',
+      });
 
-      await expect(getPrTitle(PR_URL)).resolves.toBe('Add the sessions API');
+      await expect(getPrSummary(PR_URL)).resolves.toEqual({
+        title: 'Add the sessions API',
+        state: 'MERGED',
+      });
+      expect(ghMock).toHaveBeenCalledTimes(1);
       expect(ghMock).toHaveBeenCalledWith(
         'gh',
-        ['pr', 'view', '--json', 'title', '--', PR_URL],
+        ['pr', 'view', '--json', 'title,state', '--', PR_URL],
         expect.objectContaining({ encoding: 'utf8', maxBuffer: MAX_GH_OUTPUT_BYTES }),
       );
+    });
+
+    it('reads a PR without a title as untitled', async () => {
+      ghMock.mockResolvedValueOnce({ stdout: '{"state":"OPEN"}\n', stderr: '' });
+
+      await expect(getPrSummary(PR_URL)).resolves.toEqual({ title: undefined, state: 'OPEN' });
+    });
+
+    it('rejects a state gh pr view does not document', async () => {
+      ghMock.mockResolvedValueOnce({ stdout: '{"title":"x","state":"DRAFT"}\n', stderr: '' });
+
+      await expect(getPrSummary(PR_URL)).rejects.toThrow(/state/);
     });
 
     it('rejects invalid JSON from gh pr view without a login hint', async () => {
       ghMock.mockResolvedValueOnce({ stdout: 'not json', stderr: '' });
 
-      await expect(getPrTitle(PR_URL)).rejects.toThrow(/^Invalid JSON returned from gh pr view$/);
+      await expect(getPrSummary(PR_URL)).rejects.toThrow(/^Invalid JSON returned from gh pr view$/);
     });
 
     describe('when gh never exits', () => {
@@ -559,7 +578,7 @@ describe('CLI GitHub utils', () => {
       it.each([
         ['gh pr diff', getPrPatch],
         ['gh api graphql', getPrCommentImports],
-        ['gh pr view', getPrTitle],
+        ['gh pr view', getPrSummary],
       ])(
         'kills %s with SIGKILL after 90 seconds and reports the timeout',
         async (_command, run) => {

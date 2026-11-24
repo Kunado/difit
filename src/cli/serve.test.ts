@@ -6,7 +6,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { createServer, type Server } from 'http';
 import { type AddressInfo } from 'net';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, resolve } from 'path';
 
 import { fetch } from 'undici';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -15,6 +15,7 @@ import pkg from '../../package.json' with { type: 'json' };
 
 const PR_A = 'https://github.com/octo/alpha/pull/1';
 const PR_B = 'https://github.com/octo/beta/pull/2';
+const PR_C = 'https://github.com/octo/gamma/pull/3';
 // A pid above every platform's limit, so no process has it.
 const DEAD_PID = 2_147_483_647;
 const SIGNALS = ['SIGTERM', 'SIGINT', 'SIGHUP'] as const;
@@ -22,6 +23,8 @@ const SIGNALS = ['SIGTERM', 'SIGINT', 'SIGHUP'] as const;
 const fakes = vi.hoisted(() => ({
   open: vi.fn(async (_url: string) => undefined),
   spawnBackgroundChild: vi.fn(),
+  // What gh pr view reports as each PR's state; OPEN unless a test says otherwise.
+  prStates: new Map<string, 'OPEN' | 'CLOSED' | 'MERGED'>(),
 }));
 
 // "https://github.com/octo/alpha/pull/1" -> "alpha.ts", so each PR has its own file.
@@ -41,7 +44,10 @@ const patchFor = (file: string) =>
 vi.mock('./github.js', () => ({
   getPrPatch: async (prUrl: string) => patchFor(fileOf(prUrl)),
   getPrCommentImports: async () => [],
-  getPrTitle: async (prUrl: string) => `Title of ${prUrl}`,
+  getPrSummary: async (prUrl: string) => ({
+    title: `Title of ${prUrl}`,
+    state: fakes.prStates.get(prUrl) ?? 'OPEN',
+  }),
 }));
 vi.mock('open', () => ({ default: fakes.open }));
 vi.mock('./background.js', async (importOriginal) => ({
@@ -80,6 +86,10 @@ const originalArgv = process.argv;
 const originalConfigDir = process.env.DIFIT_CONFIG_DIR;
 
 const statePath = () => join(configDir, 'server.json');
+const prsPath = () => join(configDir, 'prs.json');
+const savedUrls = async (path: string) =>
+  (JSON.parse(await readFile(path, 'utf8')) as { pullRequests: Array<{ url: string }> })
+    .pullRequests.map((row) => row.url);
 const readState = async () => JSON.parse(await readFile(statePath(), 'utf8')) as ServerState;
 
 interface ServerState {
@@ -173,9 +183,19 @@ async function serve(): Promise<{ base: string; state: ServerState }> {
 async function listSessions(base: string) {
   const response = await fetch(`${base}/api/sessions`);
   const body = (await response.json()) as {
-    sessions: Array<{ id: string; url: string; prUrl: string }>;
+    sessions: Array<{ id: string; url: string; prUrl: string; status: string }>;
   };
   return body.sessions;
+}
+
+// Waits until the server has restored its saved PRs, then reports each as [prUrl, status].
+async function restoredSessions(base: string) {
+  let sessions: Awaited<ReturnType<typeof listSessions>> = [];
+  await vi.waitFor(async () => {
+    sessions = await listSessions(base);
+    expect(sessions.every((session) => session.status !== 'restoring')).toBe(true);
+  });
+  return sessions;
 }
 
 const comment = (id: string, body: string) =>
@@ -224,6 +244,7 @@ beforeEach(async () => {
   });
 
   fakes.open.mockClear();
+  fakes.prStates.clear();
   vi.mocked(startServer).mockClear();
   // Stands in for the detached `difit serve` child: runs the same command in-process.
   fakes.spawnBackgroundChild.mockReset();
@@ -460,6 +481,8 @@ describe('difit --pr', () => {
     const sessions = await listSessions(base);
     expect(sessions).toEqual([expect.objectContaining({ prUrl: PR_A })]);
     expect(result.stdout).toContain(`${base}${sessions[0]?.url}`);
+    // The server it starts saves to the default list.
+    expect(await savedUrls(prsPath())).toEqual([PR_A]);
   });
 
   it('opens the PR page in the browser unless --no-open', async () => {
@@ -543,6 +566,7 @@ describe('difit --pr', () => {
     expect(result.stdout).toContain(`📋 Reviewing: ${PR_A}`);
     expect(fakes.spawnBackgroundChild).not.toHaveBeenCalled();
     await expect(readFile(statePath(), 'utf8')).rejects.toThrow(/ENOENT/);
+    await expect(readFile(prsPath(), 'utf8')).rejects.toThrow(/ENOENT/);
   });
 });
 
@@ -560,6 +584,111 @@ describe('single-server mode', () => {
     expect(result.stdout).toContain('🚀 difit server started on http://localhost:4966');
     expect(result.stdout).toContain('📋 Reviewing: HEAD');
     expect(fakes.spawnBackgroundChild).not.toHaveBeenCalled();
+    await expect(readFile(prsPath(), 'utf8')).rejects.toThrow(/ENOENT/);
+  });
+});
+
+describe('the saved PR list', () => {
+  it('reopens the PRs it had open after difit stop and difit serve', async () => {
+    await serve();
+    await runCli(['--pr', PR_A, '--no-open']);
+    await runCli(['--pr', PR_B, '--no-open']);
+    expect((await runCli(['stop'])).code).toBe(0);
+
+    const { base } = await serve();
+
+    const sessions = await restoredSessions(base);
+    expect(sessions.map((session) => [session.prUrl, session.status])).toEqual([
+      [PR_A, 'open'],
+      [PR_B, 'open'],
+    ]);
+    for (const session of sessions) {
+      expect((await fetch(`${base}${session.url}api/diff`)).status).toBe(200);
+    }
+  });
+
+  it('forgets a PR closed in the list, also after a restart', async () => {
+    const { base } = await serve();
+    await runCli(['--pr', PR_A, '--no-open']);
+    await runCli(['--pr', PR_B, '--no-open']);
+    const [a] = await listSessions(base);
+
+    const close = await fetch(`${base}/api/sessions/${a?.id}`, { method: 'DELETE' });
+
+    expect(close.status).toBe(200);
+    expect(await savedUrls(prsPath())).toEqual([PR_B]);
+    await runCli(['stop']);
+    const { base: next } = await serve();
+    expect((await restoredSessions(next)).map((session) => session.prUrl)).toEqual([PR_B]);
+  });
+
+  it('drops PRs merged or closed while it was stopped', async () => {
+    await serve();
+    for (const prUrl of [PR_A, PR_B, PR_C]) {
+      await runCli(['--pr', prUrl, '--no-open']);
+    }
+    await runCli(['stop']);
+    fakes.prStates.set(PR_B, 'MERGED');
+    fakes.prStates.set(PR_C, 'CLOSED');
+
+    const { base } = await serve();
+
+    expect((await restoredSessions(base)).map((session) => session.prUrl)).toEqual([PR_A]);
+    expect(await savedUrls(prsPath())).toEqual([PR_A]);
+  });
+
+  it('reads and writes only the file given with --prs', async () => {
+    const defaultList = JSON.stringify({
+      version: 1,
+      pullRequests: [{ url: PR_B, addedAt: '2026-01-01T00:00:00.000Z' }],
+    });
+    await writeFile(prsPath(), defaultList);
+    const ownList = join(configDir, 'lists', 'mine.json');
+
+    const result = await runCli(['serve', '--port', '0', '--no-open', '--prs', ownList]);
+    expect(result.code).toBe(0);
+    const state = await readState();
+    const base = `http://${state.host}:${state.port}`;
+    await runCli(['--pr', PR_A, '--no-open']);
+
+    expect((await restoredSessions(base)).map((session) => session.prUrl)).toEqual([PR_A]);
+    expect(await savedUrls(ownList)).toEqual([PR_A]);
+    expect(await readFile(prsPath(), 'utf8')).toBe(defaultList);
+    const info = await (await fetch(`${base}/api/server-info`)).json();
+    expect(info).toMatchObject({ prList: { path: ownList } });
+  });
+
+  it('hands the background server --prs as an absolute path', async () => {
+    const result = await runCli(['serve', '--background', '--port', '0', '--prs', 'mine.json']);
+
+    expect(result.code).toBe(0);
+    expect(fakes.spawnBackgroundChild).toHaveBeenCalledWith([
+      'serve',
+      '--no-open',
+      '--port',
+      '0',
+      '--prs',
+      resolve('mine.json'),
+    ]);
+  });
+
+  it('starts with a broken list, warns, and never overwrites it', async () => {
+    const broken = '{"version": 1, "pullRequests": [';
+    await writeFile(prsPath(), broken);
+
+    const result = await runCli(['serve', '--port', '0', '--no-open']);
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain(prsPath());
+    const state = await readState();
+    const base = `http://${state.host}:${state.port}`;
+    const info = (await (await fetch(`${base}/api/server-info`)).json()) as {
+      prList: { path: string; warning?: string };
+    };
+    expect(info.prList).toEqual({ path: prsPath(), warning: expect.stringContaining(prsPath()) });
+    expect((await runCli(['--pr', PR_A, '--no-open'])).code).toBe(0);
+    expect(await listSessions(base)).toEqual([expect.objectContaining({ prUrl: PR_A })]);
+    expect(await readFile(prsPath(), 'utf8')).toBe(broken);
   });
 });
 
