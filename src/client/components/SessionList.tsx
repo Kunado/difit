@@ -31,6 +31,15 @@ function parseSession(item: unknown): SessionSummary | null {
     : null;
 }
 
+// A saved PR the server is still restoring, or failed to restore, has no page to link.
+function isPending(item: unknown): boolean {
+  if (typeof item !== 'object' || item === null) {
+    return false;
+  }
+  const status = stringField(item, 'status');
+  return status === 'restoring' || status === 'failed';
+}
+
 function parseSessions(body: unknown): SessionSummary[] | null {
   if (
     typeof body !== 'object' ||
@@ -41,7 +50,7 @@ function parseSessions(body: unknown): SessionSummary[] | null {
     return null;
   }
   const items: unknown[] = body.sessions;
-  const sessions = items.map(parseSession);
+  const sessions = items.filter((item) => !isPending(item)).map(parseSession);
   return sessions.every((session): session is SessionSummary => session !== null) ? sessions : null;
 }
 

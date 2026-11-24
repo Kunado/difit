@@ -1,7 +1,6 @@
 // The multi-session server: one process, one port, one review session per GitHub PR,
 // each mounted under /s/<id>/. Kept out of server.ts so the VS Code extension, which
 // bundles server.ts, does not ship it.
-import { createHash } from 'crypto';
 import { type Server } from 'http';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -11,23 +10,27 @@ import express, { type Express, type NextFunction, type Request, type Response }
 import pkg from '../../package.json' with { type: 'json' };
 import { type CommentImport } from '../types/diff.js';
 import { normalizeCommentImports } from '../utils/commentImports.js';
-import { SESSION_ID_LENGTH } from '../utils/sessionPath.js';
 
+import { type PrList, type SavedPullRequest } from './pr-list.js';
+import {
+  identifySession,
+  labelOf,
+  parsePullRequestUrl,
+  type PullRequestRef,
+} from './pull-request-url.js';
 import { createReviewSession, type ReviewSession, startServerWithFallback } from './server.js';
+
+/** What gh pr view says about a pull request. */
+export interface PullRequestSummary {
+  title: string | undefined;
+  state: 'OPEN' | 'CLOSED' | 'MERGED';
+}
 
 /** Reads a pull request from GitHub. The CLI passes its gh-backed functions. */
 export interface PullRequestSource {
   getPrPatch(prUrl: string): Promise<string>;
   getPrCommentImports(prUrl: string): Promise<CommentImport[]>;
-  getPrTitle(prUrl: string): Promise<string | undefined>;
-}
-
-/** A pull request URL that passed parsePullRequestUrl. */
-interface PullRequestRef {
-  url: string;
-  owner: string;
-  repo: string;
-  number: number;
+  getPrSummary(prUrl: string): Promise<PullRequestSummary>;
 }
 
 interface CreateSessionRequest {
@@ -48,16 +51,11 @@ interface SessionEntry {
   pendingClean: boolean;
 }
 
-// Owner: GitHub login characters, no leading hyphen. Repo: letters, digits, `.`, `_`,
-// `-`, no leading hyphen. Number: no leading zero. Nothing may follow the number.
-const PR_URL_PATTERN =
-  /^https:\/\/github\.com\/([A-Za-z0-9][A-Za-z0-9-]{0,38})\/([A-Za-z0-9._][A-Za-z0-9._-]{0,99})\/pull\/([1-9][0-9]{0,9})$/;
-// gh api graphql sends the number as a GraphQL Int.
-const MAX_PR_NUMBER = 2_147_483_647;
 const PR_URL_ERROR =
   'prUrl must be a URL of the form https://github.com/<owner>/<repo>/pull/<number>';
 const GH_FAILURE_ERROR =
   'Could not fetch the pull request with gh. Check that it exists and that gh is installed and logged in (gh auth status). The server log has the details.';
+const OPEN_FAILURE_ERROR = 'Failed to open the session';
 
 const MAX_BODY_SIZE = '1mb';
 const DEFAULT_CLIENT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'client');
@@ -68,26 +66,10 @@ const GITHUB_TOKEN_PATTERN = /\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+/g;
 /** gh could not read the PR. The message is safe to log, not to return. */
 class PullRequestFetchError extends Error {}
 
-function parsePullRequestUrl(value: unknown): PullRequestRef | null {
-  if (typeof value !== 'string') {
-    return null;
-  }
-  const match = PR_URL_PATTERN.exec(value);
-  const [, owner, repo, digits] = match ?? [];
-  // A `.git` suffix names the same repository, so it would open a duplicate session.
-  if (
-    !owner ||
-    !repo ||
-    !digits ||
-    repo === '.' ||
-    repo.includes('..') ||
-    repo.toLowerCase().endsWith('.git')
-  ) {
-    return null;
-  }
-  const number = Number(digits);
-  return number <= MAX_PR_NUMBER ? { url: value, owner, repo, number } : null;
-}
+// The fixed text a failed open answers with and a failed restore lists; gh's own message
+// stays in the server log.
+const failureMessage = (error: unknown) =>
+  error instanceof PullRequestFetchError ? GH_FAILURE_ERROR : OPEN_FAILURE_ERROR;
 
 function parseCreateSessionRequest(
   body: unknown,
@@ -118,23 +100,6 @@ function parseCreateSessionRequest(
   }
 }
 
-// The same PR always maps to the same ids, so reopening it finds the browser's saved
-// comments and viewed marks, which the client keys by repositoryId.
-function identifySession(pr: PullRequestRef): { id: string; repositoryId: string } {
-  // GitHub owner and repository names are case-insensitive.
-  const key = `github.com/${pr.owner.toLowerCase()}/${pr.repo.toLowerCase()}/pull/${pr.number}`;
-  const digest = createHash('sha256').update(key).digest('hex');
-  return { id: digest.slice(0, SESSION_ID_LENGTH), repositoryId: digest };
-}
-
-/** The /s/<id>/ id the server gives a PR, or null when prUrl is not a PR URL it accepts. */
-export function sessionIdForPullRequest(prUrl: string): string | null {
-  const pr = parsePullRequestUrl(prUrl);
-  return pr ? identifySession(pr).id : null;
-}
-
-const labelOf = (pr: PullRequestRef) => `${pr.owner}/${pr.repo}#${pr.number}`;
-
 const maskTokens = (text: string) => text.replace(GITHUB_TOKEN_PATTERN, '[redacted]');
 
 // gh's messages help in the server log but could echo a token, so mask token shapes.
@@ -150,12 +115,21 @@ function describeErrorWithStack(error: unknown): string {
 
 const toSessionInfo = (entry: SessionEntry) => ({
   id: entry.id,
+  status: 'open' as const,
   url: `/s/${entry.id}/`,
   prUrl: entry.prUrl,
   label: entry.label,
   title: entry.title,
   createdAt: entry.createdAt,
 });
+
+// A saved PR without a session yet: it has no page, so no url.
+const toPendingInfo = ({ id, pr }: SavedPullRequest, error: string | undefined) => {
+  const row = { id, prUrl: pr.url, label: labelOf(pr) };
+  return error === undefined
+    ? { ...row, status: 'restoring' as const }
+    : { ...row, status: 'failed' as const, error };
+};
 
 // Blocks DNS rebinding (a foreign Host) and requests from other sites (a foreign Origin).
 // Reads are covered too: the watch and heartbeat routes send Access-Control-Allow-Origin: *,
@@ -230,23 +204,36 @@ function sendClientPage(clientDir: string, res: Response): void {
   });
 }
 
+/**
+ * The multi-session app and the restore of the PRs its list saved. Every saved PR is
+ * listed as restoring until restoreSessions reaches it.
+ */
 export function createMultiSessionApp({
   github,
+  prList,
   clientDir = DEFAULT_CLIENT_DIR,
 }: {
   github: PullRequestSource;
+  prList: PrList;
   clientDir?: string;
-}): Express {
+}): { app: Express; restoreSessions: () => Promise<void> } {
   const startedAt = new Date().toISOString();
-  // Insertion order is creation order, which GET /api/sessions reports.
+  // Every saved PR is in exactly one of: sessions (open), creating (being opened or
+  // restored), queued (waiting for its restore), failed. GET /api/sessions lists them in
+  // prList order. A PR being opened for the first time is in creating only.
   const sessions = new Map<string, SessionEntry>();
-  // Creations still waiting on gh, so concurrent requests for one PR share them.
-  const creating = new Map<string, Promise<SessionEntry>>();
+  // Creations still running, so concurrent requests for one PR share them. A restore
+  // resolves to null when it finds the PR merged or closed.
+  const creating = new Map<string, Promise<SessionEntry | null>>();
+  const queued = new Set(prList.list().map(({ id }) => id));
+  // The fixed error text of each saved PR whose restore or retry failed.
+  const failed = new Map<string, string>();
 
   async function createEntry(
     id: string,
     repositoryId: string,
     { pr, commentImports, clean }: CreateSessionRequest,
+    titleRequest: Promise<string | undefined>,
   ): Promise<SessionEntry> {
     const label = labelOf(pr);
     const [patch, prCommentImports, title] = await Promise.all([
@@ -260,7 +247,7 @@ export function createMultiSessionApp({
         );
         return [];
       }),
-      github.getPrTitle(pr.url).catch(() => undefined),
+      titleRequest,
     ]);
     const session = await createReviewSession(
       { stdinDiff: patch, commentImports: [...prCommentImports, ...commentImports], repositoryId },
@@ -288,6 +275,36 @@ export function createMultiSessionApp({
     return { entry, created: false };
   }
 
+  // Runs one creation of the PR's session. A created session is saved to the list before
+  // the creation settles; a saved PR whose creation fails is listed as failed.
+  function track<T extends SessionEntry | null>(
+    pr: PullRequestRef,
+    id: string,
+    create: () => Promise<T>,
+  ): Promise<T> {
+    queued.delete(id);
+    failed.delete(id);
+    const creation = create()
+      .then(
+        async (entry) => {
+          if (entry) {
+            sessions.set(id, entry);
+            await prList.add(pr);
+          }
+          return entry;
+        },
+        (error: unknown) => {
+          if (prList.has(id)) {
+            failed.set(id, failureMessage(error));
+          }
+          throw error;
+        },
+      )
+      .finally(() => creating.delete(id));
+    creating.set(id, creation);
+    return creation;
+  }
+
   async function openSession(
     request: CreateSessionRequest,
   ): Promise<{ entry: SessionEntry; created: boolean }> {
@@ -298,18 +315,64 @@ export function createMultiSessionApp({
     }
     const pending = creating.get(id);
     if (pending) {
-      return reuseSession(await pending, request);
+      const entry = await pending;
+      // A restore that found the PR merged or closed opened nothing; this request still
+      // asks for it.
+      return entry ? reuseSession(entry, request) : openSession(request);
     }
 
-    const creation = createEntry(id, repositoryId, request)
-      .then((entry) => {
-        sessions.set(id, entry);
-        return entry;
-      })
-      .finally(() => creating.delete(id));
-    creating.set(id, creation);
-    return { entry: await creation, created: true };
+    // Like `difit --pr`, a PR without its title is still worth opening.
+    const title = github.getPrSummary(request.pr.url).then(
+      (summary) => summary.title,
+      () => undefined,
+    );
+    const entry = await track(request.pr, id, () => createEntry(id, repositoryId, request, title));
+    return { entry, created: true };
   }
+
+  // One gh pr view tells whether the PR is still open and gives its title.
+  async function restoreEntry({ id, pr }: SavedPullRequest): Promise<SessionEntry | null> {
+    const summary = await github.getPrSummary(pr.url).catch((error: unknown) => {
+      throw new PullRequestFetchError(describeError(error));
+    });
+    if (summary.state !== 'OPEN') {
+      console.log(`Removed ${labelOf(pr)} from the PR list: it is ${summary.state.toLowerCase()}`);
+      await prList.remove(id);
+      return null;
+    }
+    return createEntry(
+      id,
+      identifySession(pr).repositoryId,
+      { pr, commentImports: [], clean: false },
+      Promise.resolve(summary.title),
+    );
+  }
+
+  // One PR at a time, oldest first. A PR opened, closed, or retried meanwhile has left
+  // the queue, and a Set's iteration skips entries deleted before it reaches them.
+  async function restoreSessions(): Promise<void> {
+    for (const id of queued) {
+      const saved = prList.get(id);
+      if (!saved) {
+        queued.delete(id);
+        continue;
+      }
+      try {
+        await track(saved.pr, id, () => restoreEntry(saved));
+      } catch (error) {
+        const reason =
+          error instanceof PullRequestFetchError
+            ? `gh failed: ${error.message}`
+            : describeErrorWithStack(error);
+        console.error(`Failed to restore ${labelOf(saved.pr)}: ${reason}`);
+      }
+    }
+  }
+
+  const describeSaved = (saved: SavedPullRequest) => {
+    const entry = sessions.get(saved.id);
+    return entry ? toSessionInfo(entry) : toPendingInfo(saved, failed.get(saved.id));
+  };
 
   const app = express();
   app.use(guardRequest);
@@ -317,11 +380,19 @@ export function createMultiSessionApp({
   app.use(express.text({ limit: MAX_BODY_SIZE })); // sendBeacon posts comments as text/plain
 
   app.get('/api/server-info', (_req, res) => {
-    res.json({ app: 'difit', mode: 'multi', version: pkg.version, pid: process.pid, startedAt });
+    res.json({
+      app: 'difit',
+      mode: 'multi',
+      version: pkg.version,
+      pid: process.pid,
+      startedAt,
+      // A background server's stderr goes nowhere, so a list it cannot save says so here.
+      prList: { path: prList.path, warning: prList.warning() },
+    });
   });
 
   app.get('/api/sessions', (_req, res) => {
-    res.json({ sessions: Array.from(sessions.values(), toSessionInfo) });
+    res.json({ sessions: prList.list().map(describeSaved) });
   });
 
   app.post('/api/sessions', requireJsonContentType, async (req, res) => {
@@ -341,23 +412,29 @@ export function createMultiSessionApp({
         return;
       }
       console.error(`Failed to open a session for ${label}: ${describeErrorWithStack(error)}`);
-      res.status(500).json({ error: 'Failed to open the session' });
+      res.status(500).json({ error: OPEN_FAILURE_ERROR });
     }
   });
 
+  // Closes an open PR, or drops a saved one still waiting for its restore or failed. The
+  // list is saved before the answer.
   app.delete('/api/sessions/:id', requireJsonContentType, async (req, res) => {
-    if (creating.has(req.params.id)) {
+    const { id } = req.params;
+    if (creating.has(id)) {
       res.status(409).json({ error: 'Session is still being created; retry once it is open' });
       return;
     }
-    const entry = sessions.get(req.params.id);
-    if (!entry) {
+    const entry = sessions.get(id);
+    if (!entry && !queued.has(id) && !failed.has(id)) {
       res.status(404).json({ error: 'Unknown session' });
       return;
     }
-    sessions.delete(entry.id);
-    await entry.session.dispose();
-    res.json({ success: true, id: entry.id });
+    sessions.delete(id);
+    queued.delete(id);
+    failed.delete(id);
+    await prList.remove(id);
+    await entry?.session.dispose();
+    res.json({ success: true, id });
   });
 
   app.get('/', (_req, res) => {
@@ -389,14 +466,15 @@ export function createMultiSessionApp({
   });
   app.use(handleError);
 
-  return app;
+  return { app, restoreSessions };
 }
 
 export async function startMultiServer(options: {
   github: PullRequestSource;
+  prList: PrList;
   preferredPort?: number;
   host?: string;
-}): Promise<{ port: number; url: string; server: Server }> {
+}): Promise<{ port: number; url: string; server: Server; restoreSessions: () => Promise<void> }> {
   const host = options.host ?? 'localhost';
   // POST /api/sessions runs gh with the user's GitHub token; never listen beyond loopback.
   if (!LISTEN_HOSTS.has(host)) {
@@ -404,15 +482,12 @@ export async function startMultiServer(options: {
       `The multi-session server only listens on loopback (localhost or 127.0.0.1), not ${host}`,
     );
   }
-  const { server } = await startServerWithFallback(
-    createMultiSessionApp(options),
-    options.preferredPort ?? 4966,
-    host,
-  );
+  const { app, restoreSessions } = createMultiSessionApp(options);
+  const { server } = await startServerWithFallback(app, options.preferredPort ?? 4966, host);
   // startServerWithFallback reports the port it asked for; with 0 the OS picks another.
   const address = server.address();
   if (typeof address !== 'object' || address === null) {
     throw new Error('The multi-session server is not listening on a TCP port');
   }
-  return { port: address.port, url: `http://${host}:${address.port}`, server };
+  return { port: address.port, url: `http://${host}:${address.port}`, server, restoreSessions };
 }
