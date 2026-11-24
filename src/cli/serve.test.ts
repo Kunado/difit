@@ -87,9 +87,10 @@ const originalConfigDir = process.env.DIFIT_CONFIG_DIR;
 
 const statePath = () => join(configDir, 'server.json');
 const prsPath = () => join(configDir, 'prs.json');
-const savedUrls = async (path: string) =>
-  (JSON.parse(await readFile(path, 'utf8')) as { pullRequests: Array<{ url: string }> })
-    .pullRequests.map((row) => row.url);
+async function savedUrls(path: string): Promise<string[]> {
+  const file: { pullRequests: Array<{ url: string }> } = JSON.parse(await readFile(path, 'utf8'));
+  return file.pullRequests.map((row) => row.url);
+}
 const readState = async () => JSON.parse(await readFile(statePath(), 'utf8')) as ServerState;
 
 interface ServerState {
@@ -637,7 +638,8 @@ describe('the saved PR list', () => {
     const { base } = await serve();
 
     expect((await restoredSessions(base)).map((session) => session.prUrl)).toEqual([PR_A]);
-    expect(await savedUrls(prsPath())).toEqual([PR_A]);
+    // The list drops a PR at once and writes the file right after.
+    await vi.waitFor(async () => expect(await savedUrls(prsPath())).toEqual([PR_A]));
   });
 
   it('reads and writes only the file given with --prs', async () => {

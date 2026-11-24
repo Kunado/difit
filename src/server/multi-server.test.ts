@@ -158,10 +158,10 @@ async function startApp(
 
 const readPrsFile = async (prsPath: string) => JSON.parse(await readFile(prsPath, 'utf8'));
 
-const savedUrls = async (prsPath: string) =>
-  ((await readPrsFile(prsPath)) as { pullRequests: Array<{ url: string }> }).pullRequests.map(
-    (row) => row.url,
-  );
+async function savedUrls(prsPath: string): Promise<string[]> {
+  const file: { pullRequests: Array<{ url: string }> } = await readPrsFile(prsPath);
+  return file.pullRequests.map((row) => row.url);
+}
 
 async function writePrsFile(rows: unknown[]): Promise<string> {
   const prsPath = join(await makeTempDir(), 'prs.json');
@@ -189,9 +189,19 @@ const deleteSession = (base: string, id: string) =>
 
 const getJson = async (url: string) => (await fetch(url)).json() as Promise<any>;
 
-const listSessions = async (base: string) =>
-  ((await getJson(`${base}/api/sessions`)) as { sessions: Array<{ id: string; label: string }> })
-    .sessions;
+interface SessionRow {
+  id: string;
+  status: string;
+  prUrl: string;
+  label: string;
+  url?: string;
+  title?: string;
+}
+
+async function listSessions(base: string): Promise<SessionRow[]> {
+  const body: { sessions: SessionRow[] } = await getJson(`${base}/api/sessions`);
+  return body.sessions;
+}
 
 const postComments = (url: string, threads: unknown[]) =>
   fetch(url, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ threads }) });
@@ -959,9 +969,7 @@ describe('restoring the saved PR list', () => {
   });
 
   const statuses = async (base: string) =>
-    ((await listSessions(base)) as Array<{ prUrl: string; status: string }>).map(
-      ({ prUrl, status }) => [prUrl, status],
-    );
+    (await listSessions(base)).map(({ prUrl, status }) => [prUrl, status]);
 
   it('lists saved PRs as restoring by when they were added, then opens them one by one', async () => {
     const unreadable = { url: 'https://example.com/octo/alpha/pull/1', addedAt: 'yesterday' };
@@ -983,7 +991,7 @@ describe('restoring the saved PR list', () => {
 
     await restoreSessions();
 
-    const sessions = (await listSessions(base)) as Array<{ url: string; title: string }>;
+    const sessions = await listSessions(base);
     expect(await statuses(base)).toEqual([
       [PR_A, 'open'],
       [PR_B, 'open'],
@@ -1093,7 +1101,7 @@ describe('restoring the saved PR list', () => {
       return patchFor(fileOf(prUrl));
     });
     const { base, restoreSessions } = await startApp(github, { prsPath });
-    const [a, b, c] = (await listSessions(base)) as Array<{ id: string }>;
+    const [a, b, c] = await listSessions(base);
 
     const restoring = restoreSessions();
     await vi.waitFor(() => expect(github.getPrSummary).toHaveBeenCalledTimes(1));
