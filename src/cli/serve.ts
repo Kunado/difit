@@ -154,9 +154,6 @@ async function serve({
       return;
     }
     stopping = true;
-    // Stop accepting new requests first
-    server.closeAllConnections();
-    server.close();
     // Wait for in-flight and queued saves to complete, up to the timeout
     const completed = await prList.flush(SHUTDOWN_FLUSH_TIMEOUT_MS);
     if (!completed) {
@@ -165,6 +162,10 @@ async function serve({
       await prList.discardTempFile();
     }
     releaseServerState(state);
+    // Close the server after flush and state cleanup, so difit stop sees the port
+    // refused only after prs.json is fully written.
+    server.closeAllConnections();
+    server.close();
     process.exit(0);
   };
   for (const signal of SHUTDOWN_SIGNALS) {
