@@ -2,6 +2,7 @@
 // imports a fresh copy of index.ts, and waits for commander to finish. Servers listen on
 // port 0, the state file lives in a temporary DIFIT_CONFIG_DIR, gh and the browser are
 // fakes, and signals to this process are delivered to its listeners instead.
+import { promises as fsPromises } from 'fs';
 import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { createServer, type Server } from 'http';
 import { type AddressInfo } from 'net';
@@ -360,23 +361,54 @@ describe('difit serve', () => {
     await expect(fetch(`${base}/api/server-info`)).rejects.toThrow();
   });
 
-  it('completes flush before closing the server on shutdown', async () => {
-    // Verifies that shutDown waits for flush to complete before calling server.close().
-    // The ideal test would spy on the call order of flush(), close(), and releaseServerState(),
-    // but those are internal to serve()'s closure. Instead, we verify the observable behavior:
-    // PRs added before shutdown are saved to prs.json, confirming flush completed.
-    await serve();
+  it('keeps the port open and the state file until the pending save is flushed, then closes and exits', async () => {
+    const { base } = await serve();
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    let saving = false;
+    const realRename = fsPromises.rename.bind(fsPromises);
+    // Holds the rename of prs.json, so the save stays in flight until the gate opens.
+    vi.spyOn(fsPromises, 'rename').mockImplementation(async (from, to) => {
+      if (to === prsPath()) {
+        saving = true;
+        await gate;
+      }
+      return realRename(from, to);
+    });
+    const exit = vi.mocked(process.exit);
+    let shutdown: Promise<void> | undefined;
 
-    // Add PRs to trigger save operations
-    await runCli(['--pr', PR_A, '--no-open']);
-    await runCli(['--pr', PR_B, '--no-open']);
+    try {
+      const adding = fetch(`${base}/api/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prUrl: PR_A, commentImports: [], clean: false }),
+      }).catch(() => undefined);
+      await vi.waitFor(() => expect(saving).toBe(true));
 
-    // Shutdown and verify the PRs were flushed to disk
-    await deliver('SIGTERM');
+      shutdown = deliver('SIGTERM');
 
-    // After shutdown, prs.json should contain both PRs (flush completed before process exit)
-    const urls = await savedUrls(prsPath());
-    expect(urls).toEqual([PR_A, PR_B]);
+      // difit stop treats a refused port as "stopped", so the port must answer while saving.
+      const info = await fetch(`${base}/api/server-info`);
+      expect(info.status).toBe(200);
+      expect(exit).not.toHaveBeenCalled();
+      expect(JSON.parse(await readFile(statePath(), 'utf8'))).toMatchObject({ pid: process.pid });
+
+      openGate();
+      await shutdown;
+      await adding;
+
+      expect(exit).toHaveBeenCalledWith(0);
+      await expect(readFile(statePath(), 'utf8')).rejects.toThrow(/ENOENT/);
+      await expect(fetch(`${base}/api/server-info`)).rejects.toThrow();
+      expect(await savedUrls(prsPath())).toEqual([PR_A]);
+    } finally {
+      // Let a failed run finish its shutdown while the mocks are still in place.
+      openGate();
+      await shutdown;
+    }
   });
 
   it('starts in the background and prints the child handshake', async () => {
