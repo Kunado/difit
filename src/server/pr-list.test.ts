@@ -45,6 +45,43 @@ describe('flush with timeout', () => {
     }
   });
 
+  it('waits for saves added during flush and returns true when all complete', async () => {
+    const prsPath = join(await makeTempDir(), 'prs.json');
+    const prList = await openPrList(prsPath);
+
+    // 1本目の保存を開始
+    const save1 = prList.add({ url: PR_A, owner: 'octo', repo: 'alpha', number: 1 });
+
+    // flush を開始
+    const flushPromise = prList.flush(3000);
+
+    // flush 中に2本目の保存を積む
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const save2 = prList.add({
+      url: 'https://github.com/octo/beta/pull/2',
+      owner: 'octo',
+      repo: 'beta',
+      number: 2,
+    });
+
+    // flush は両方の保存が終わってから true を返す
+    const completed = await flushPromise;
+    expect(completed).toBe(true);
+
+    // 両方の保存が完了している
+    await save1;
+    await save2;
+
+    // prs.json に両方の内容が入っている
+    const list = prList.list();
+    expect(list).toHaveLength(2);
+    expect(list.map((pr) => pr.pr.url)).toEqual([PR_A, 'https://github.com/octo/beta/pull/2']);
+
+    // 一時ファイルが残っていない
+    const files = await readdir(join(prsPath, '..'));
+    expect(files).toEqual(['prs.json']);
+  });
+
   it('returns false after timeout if saves take too long', async () => {
     vi.useFakeTimers();
     try {
@@ -71,6 +108,51 @@ describe('flush with timeout', () => {
       vi.useRealTimers();
       throw error;
     }
+  });
+
+  it('returns false after timeout and does not leave timers running', async () => {
+    vi.useFakeTimers();
+    try {
+      const prsPath = join(await makeTempDir(), 'prs.json');
+      const prList = await openPrList(prsPath);
+
+      // 保存を開始（実際の書き込みが発生）
+      const savePromise = prList.add({ url: PR_A, owner: 'octo', repo: 'alpha', number: 1 });
+
+      // flush を呼ぶ（1ms のタイムアウト）
+      const flushPromise = prList.flush(1);
+
+      // タイムアウトまで進める
+      await vi.advanceTimersByTimeAsync(1);
+
+      // flush が完了し、false を返す
+      const completed = await flushPromise;
+      expect(completed).toBe(false);
+
+      // タイマーが残っていない
+      expect(vi.getTimerCount()).toBe(0);
+
+      // タイマーをリセットする前に保存を完了させる
+      vi.useRealTimers();
+      await savePromise;
+    } catch (error) {
+      vi.useRealTimers();
+      throw error;
+    }
+  });
+
+  it('returns true immediately when no saves are pending', async () => {
+    const prsPath = join(await makeTempDir(), 'prs.json');
+    const prList = await openPrList(prsPath);
+
+    // 何も保存していない状態で flush
+    const start = Date.now();
+    const completed = await prList.flush(3000);
+    const elapsed = Date.now() - start;
+
+    expect(completed).toBe(true);
+    // ほとんど待たずに完了する
+    expect(elapsed).toBeLessThan(100);
   });
 });
 

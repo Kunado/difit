@@ -162,12 +162,14 @@ async function serve({
       await prList.discardTempFile();
     }
     releaseServerState(state);
+    // Close the server after flush and state cleanup, so difit stop sees the port
+    // refused only after prs.json is fully written.
     server.closeAllConnections();
     server.close();
     process.exit(0);
   };
   for (const signal of SHUTDOWN_SIGNALS) {
-    process.on(signal, () => void shutDown());
+    process.on(signal, () => shutDown());
   }
   return state;
 }

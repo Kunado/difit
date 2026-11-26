@@ -3,7 +3,7 @@
 //   { "version": 1, "pullRequests": [{ "url": "https://github.com/...", "addedAt": "<ISO>" }] }
 // Rows come oldest first. A file it cannot read as that shape is never overwritten.
 import { promises as fs } from 'fs';
-import { dirname, join } from 'path';
+import { basename, dirname, join } from 'path';
 
 import { identifySession, parsePullRequestUrl, type PullRequestRef } from './pull-request-url.js';
 import { getUserConfigPath } from './user-config.js';
@@ -99,9 +99,9 @@ async function readContents(path: string): Promise<Contents> {
   // Clean up stale temporary files from previous servers that didn't shut down cleanly.
   // Pattern: <basename>.<pid>.tmp where pid is numeric
   const dir = dirname(path);
-  const basename = path.split('/').pop() ?? '';
+  const filename = basename(path);
   const tmpPattern = new RegExp(
-    `^${basename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.(\\d+)\\.tmp$`,
+    `^${filename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.(\\d+)\\.tmp$`,
   );
   try {
     const files = await fs.readdir(dir);
@@ -221,12 +221,46 @@ export async function openPrList(path: string): Promise<PrList> {
       if (access.kind === 'read-only') {
         return true;
       }
-      // Wait for in-flight and queued saves, up to the timeout
-      const completed = await Promise.race([
-        lastSave.then(() => true),
-        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
-      ]);
-      return completed;
+      const deadline = Date.now() + timeoutMs;
+      let timerId: NodeJS.Timeout | undefined;
+
+      try {
+        // 保存が動かなくなるまで（lastSave が変わらなくなるまで）繰り返し待つ
+        while (true) {
+          const current = lastSave;
+          const remaining = deadline - Date.now();
+
+          if (remaining <= 0) {
+            return false;
+          }
+
+          const completed = await Promise.race([
+            current.then(() => true),
+            new Promise<boolean>((resolve) => {
+              timerId = setTimeout(() => resolve(false), remaining);
+            }),
+          ]);
+
+          if (timerId !== undefined) {
+            clearTimeout(timerId);
+            timerId = undefined;
+          }
+
+          if (!completed) {
+            return false; // タイムアウト
+          }
+
+          // 保存が動かなくなった（新しい保存が積まれていない）
+          if (lastSave === current) {
+            return true;
+          }
+          // まだ新しい保存がある、ループ継続
+        }
+      } finally {
+        if (timerId !== undefined) {
+          clearTimeout(timerId);
+        }
+      }
     },
     async discardTempFile() {
       const tmpPath = `${path}.${process.pid}.tmp`;

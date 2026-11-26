@@ -2,6 +2,7 @@
 // imports a fresh copy of index.ts, and waits for commander to finish. Servers listen on
 // port 0, the state file lives in a temporary DIFIT_CONFIG_DIR, gh and the browser are
 // fakes, and signals to this process are delivered to its listeners instead.
+import { promises as fsPromises } from 'fs';
 import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { createServer, type Server } from 'http';
 import { type AddressInfo } from 'net';
@@ -130,14 +131,14 @@ async function deliver(signal: (typeof SIGNALS)[number]): Promise<void> {
   const baseline = baselineListeners.get(signal) ?? [];
   for (const listener of process.listeners(signal)) {
     if (!baseline.includes(listener)) {
-      try {
-        const result = (listener as (signal: string) => void | Promise<void>)(signal);
-        if (result instanceof Promise) {
+      const result = (listener as (signal: string) => void | Promise<void>)(signal);
+      if (result instanceof Promise) {
+        try {
           await result;
-        }
-      } catch (error) {
-        if (!(error instanceof ExitError)) {
-          throw error;
+        } catch (error) {
+          if (!(error instanceof ExitError)) {
+            throw error;
+          }
         }
       }
     }
@@ -355,11 +356,59 @@ describe('difit serve', () => {
     const { base } = await serve();
 
     await deliver('SIGTERM');
-    // shutDown is async; wait a bit for it to complete
-    await new Promise((resolve) => setTimeout(resolve, 100));
 
     await expect(readFile(statePath(), 'utf8')).rejects.toThrow(/ENOENT/);
     await expect(fetch(`${base}/api/server-info`)).rejects.toThrow();
+  });
+
+  it('keeps the port open and the state file until the pending save is flushed, then closes and exits', async () => {
+    const { base } = await serve();
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    let saving = false;
+    const realRename = fsPromises.rename.bind(fsPromises);
+    // Holds the rename of prs.json, so the save stays in flight until the gate opens.
+    vi.spyOn(fsPromises, 'rename').mockImplementation(async (from, to) => {
+      if (to === prsPath()) {
+        saving = true;
+        await gate;
+      }
+      return realRename(from, to);
+    });
+    const exit = vi.mocked(process.exit);
+    let shutdown: Promise<void> | undefined;
+
+    try {
+      const adding = fetch(`${base}/api/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prUrl: PR_A, commentImports: [], clean: false }),
+      }).catch(() => undefined);
+      await vi.waitFor(() => expect(saving).toBe(true));
+
+      shutdown = deliver('SIGTERM');
+
+      // difit stop treats a refused port as "stopped", so the port must answer while saving.
+      const info = await fetch(`${base}/api/server-info`);
+      expect(info.status).toBe(200);
+      expect(exit).not.toHaveBeenCalled();
+      expect(JSON.parse(await readFile(statePath(), 'utf8'))).toMatchObject({ pid: process.pid });
+
+      openGate();
+      await shutdown;
+      await adding;
+
+      expect(exit).toHaveBeenCalledWith(0);
+      await expect(readFile(statePath(), 'utf8')).rejects.toThrow(/ENOENT/);
+      await expect(fetch(`${base}/api/server-info`)).rejects.toThrow();
+      expect(await savedUrls(prsPath())).toEqual([PR_A]);
+    } finally {
+      // Let a failed run finish its shutdown while the mocks are still in place.
+      openGate();
+      await shutdown;
+    }
   });
 
   it('starts in the background and prints the child handshake', async () => {
