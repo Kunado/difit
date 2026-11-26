@@ -53,12 +53,32 @@ interface PendingSession {
   error?: string;
 }
 
-// Answers like the multi-session server: GET /api/sessions lists `open`, and
-// DELETE /api/sessions/:id removes the session from it.
+const RESTORING: PendingSession = {
+  id: 'cccccccccccccccc',
+  status: 'restoring',
+  prUrl: 'https://github.com/octo/gamma/pull/3',
+  label: 'octo/gamma#3',
+};
+
+const FAILED: PendingSession = {
+  id: 'dddddddddddddddd',
+  status: 'failed',
+  prUrl: 'https://github.com/octo/delta/pull/4',
+  label: 'octo/delta#4',
+  error: 'Could not fetch the pull request with gh.',
+};
+
+// Answers like the multi-session server: GET /api/sessions lists `open`,
+// GET /api/server-info reports `prList.warning`, and DELETE /api/sessions/:id removes the
+// session from the list.
 function fakeServer(initial: Array<FakeSession | PendingSession>) {
   const open = [...initial];
   const requests: RecordedRequest[] = [];
-  const state = { failDeletes: false };
+  const state: { failDeletes: boolean; warning: string | undefined; serverInfoStatus: number } = {
+    failDeletes: false,
+    warning: undefined,
+    serverInfoStatus: 200,
+  };
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -67,6 +87,16 @@ function fakeServer(initial: Array<FakeSession | PendingSession>) {
       requests.push({ url, method, headers: new Headers(init?.headers), body: init?.body });
       if (method === 'GET' && url === '/api/sessions') {
         return jsonResponse({ sessions: open });
+      }
+      if (method === 'GET' && url === '/api/server-info') {
+        return jsonResponse(
+          {
+            app: 'difit',
+            mode: 'multi',
+            prList: { path: '/home/me/.difit/prs.json', warning: state.warning },
+          },
+          state.serverInfoStatus,
+        );
       }
       const id = /^\/api\/sessions\/([^/]+)$/.exec(url)?.[1];
       if (method === 'DELETE' && id !== undefined) {
@@ -125,27 +155,76 @@ describe('SessionList', () => {
   });
 
   it('keeps listing the open PRs while saved ones are being restored or failed', async () => {
-    fakeServer([
-      ALPHA,
-      {
-        id: 'cccccccccccccccc',
-        status: 'restoring',
-        prUrl: 'https://github.com/octo/gamma/pull/3',
-        label: 'octo/gamma#3',
-      },
-      {
-        id: 'dddddddddddddddd',
-        status: 'failed',
-        prUrl: 'https://github.com/octo/delta/pull/4',
-        label: 'octo/delta#4',
-        error: 'Could not fetch the pull request with gh.',
-      },
-    ]);
+    fakeServer([ALPHA, RESTORING, FAILED]);
 
     render(<SessionList />);
 
     expect(await screen.findByRole('link', { name: /octo\/alpha#1/ })).toBeInTheDocument();
     expect(screen.queryByText(/Could not load/)).not.toBeInTheDocument();
+  });
+
+  it('shows a PR being restored as restoring, without a link or a Close button', async () => {
+    fakeServer([ALPHA, RESTORING]);
+
+    render(<SessionList />);
+
+    expect(await screen.findByText(RESTORING.label)).toBeInTheDocument();
+    expect(screen.getByText(/Restoring/)).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /octo\/gamma#3/ })).not.toBeInTheDocument();
+    // The server answers 409 to a DELETE while the PR is being created, and the list
+    // cannot tell a PR waiting to be restored from one being restored.
+    expect(screen.queryByRole('button', { name: 'Close octo/gamma#3' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Close octo/alpha#1' })).toBeInTheDocument();
+  });
+
+  it('shows a PR that failed to restore as failed with the server error, without a link', async () => {
+    fakeServer([FAILED]);
+
+    render(<SessionList />);
+
+    expect(await screen.findByText(FAILED.label)).toBeInTheDocument();
+    expect(screen.getByText(/Failed/)).toBeInTheDocument();
+    expect(screen.getByText(FAILED.error ?? '')).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /octo\/delta#4/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Restoring/)).not.toBeInTheDocument();
+  });
+
+  it('closes a failed PR with a DELETE, then drops its row', async () => {
+    const server = fakeServer([ALPHA, FAILED]);
+    const user = userEvent.setup();
+    render(<SessionList />);
+
+    await user.click(await screen.findByRole('button', { name: 'Close octo/delta#4' }));
+
+    await waitFor(() => expect(screen.queryByText(FAILED.label)).not.toBeInTheDocument());
+    const deletes = server.requests.filter((request) => request.method === 'DELETE');
+    expect(deletes.map((request) => request.url)).toEqual(['/api/sessions/dddddddddddddddd']);
+    expect(deletes[0]?.headers.get('Content-Type')).toBe('application/json');
+    expect(screen.getByText(ALPHA.label)).toBeInTheDocument();
+  });
+
+  it('turns a restoring row into a link once the server has opened the PR', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    const server = fakeServer([RESTORING]);
+    render(<SessionList />);
+    expect(await screen.findByText(/Restoring/)).toBeInTheDocument();
+
+    server.open.splice(0, 1, {
+      id: RESTORING.id,
+      url: '/s/cccccccccccccccc/',
+      prUrl: RESTORING.prUrl,
+      label: RESTORING.label,
+      title: 'Gamma is open',
+      createdAt: '2026-11-24T07:08:09.000Z',
+    });
+    await act(() => vi.advanceTimersByTimeAsync(5000));
+
+    expect(await screen.findByRole('link', { name: /octo\/gamma#3/ })).toHaveAttribute(
+      'href',
+      '/s/cccccccccccccccc/',
+    );
+    expect(screen.queryByText(/Restoring/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Close octo/gamma#3' })).toBeInTheDocument();
   });
 
   it('links each PR to its review page', async () => {
@@ -246,5 +325,58 @@ describe('SessionList', () => {
     act(() => setVisibility('visible'));
 
     expect(await screen.findByText(BETA.label)).toBeInTheDocument();
+  });
+
+  it('warns at the top when the server cannot read or save the PR list', async () => {
+    const server = fakeServer([ALPHA]);
+    server.state.warning =
+      'prs.json is not valid JSON. The PR list is not saved until the file is fixed or removed and difit restarts.';
+
+    render(<SessionList />);
+
+    const warning = await screen.findByText(/prs\.json is not valid JSON/);
+    expect(warning).toBeInTheDocument();
+    expect(screen.getByText(ALPHA.label)).toBeInTheDocument();
+    expect(
+      warning.compareDocumentPosition(screen.getByText(ALPHA.label)) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(server.requests.some((request) => request.url === '/api/server-info')).toBe(true);
+  });
+
+  it('shows no warning when the PR list is fine', async () => {
+    fakeServer([ALPHA]);
+
+    render(<SessionList />);
+
+    expect(await screen.findByText(ALPHA.label)).toBeInTheDocument();
+    expect(screen.queryByText(/not saved/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('still lists the PRs when the server info cannot be read', async () => {
+    const server = fakeServer([ALPHA]);
+    server.state.serverInfoStatus = 500;
+
+    render(<SessionList />);
+
+    expect(await screen.findByText(ALPHA.label)).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('picks up a warning that appears later, and drops it once it is gone', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    const server = fakeServer([ALPHA]);
+    render(<SessionList />);
+    expect(await screen.findByText(ALPHA.label)).toBeInTheDocument();
+    expect(screen.queryByText(/Could not save/)).not.toBeInTheDocument();
+
+    server.state.warning = 'Could not save the PR list: disk full';
+    await act(() => vi.advanceTimersByTimeAsync(5000));
+    expect(await screen.findByText(/Could not save the PR list/)).toBeInTheDocument();
+
+    server.state.warning = undefined;
+    await act(() => vi.advanceTimersByTimeAsync(5000));
+    await waitFor(() => expect(screen.queryByText(/Could not save/)).not.toBeInTheDocument());
   });
 });
