@@ -188,6 +188,7 @@ Stdin mode is selected with intent-first rules:
 | `--include-untracked` | false           | Automatically include untracked files in diff (only with `.` or `working`)                                   |
 | `--keep-alive`        | false           | Keep server running after browser disconnects (stop manually with Ctrl+C)                                    |
 | `--background`        | false           | Keep the server running in the background and output JSON connection info                                    |
+| `serve --prs <path>`  | -               | JSON file that keeps the open PRs across restarts (`serve` only; default `~/.difit/prs.json`)                |
 | `--context <lines>`   | git default (3) | Limit surrounding context lines per change (`0` shows changes only; not available with `--pr` or stdin)      |
 
 ## 💬 Comment System

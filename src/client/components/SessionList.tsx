@@ -2,14 +2,15 @@ import { useCallback, useEffect, useState } from 'react';
 
 import { Logo } from './Logo';
 
-/** One open PR, as GET /api/sessions reports it. */
-interface SessionSummary {
-  id: string;
-  url: string;
-  label: string;
-  title: string | undefined;
-  createdAt: string;
-}
+/**
+ * One saved PR, as GET /api/sessions reports it. Only an open one has a page to link; a
+ * restoring one is still being fetched, and a failed one could not be.
+ */
+type SessionSummary = { id: string; label: string } & (
+  | { status: 'open'; url: string; title: string | undefined; createdAt: string }
+  | { status: 'restoring' }
+  | { status: 'failed'; error: string | undefined }
+);
 
 const POLL_INTERVAL_MS = 3000;
 
@@ -23,21 +24,22 @@ function parseSession(item: unknown): SessionSummary | null {
     return null;
   }
   const id = stringField(item, 'id');
-  const url = stringField(item, 'url');
   const label = stringField(item, 'label');
-  const createdAt = stringField(item, 'createdAt');
-  return id && url && label && createdAt
-    ? { id, url, label, title: stringField(item, 'title'), createdAt }
-    : null;
-}
-
-// A saved PR the server is still restoring, or failed to restore, has no page to link.
-function isPending(item: unknown): boolean {
-  if (typeof item !== 'object' || item === null) {
-    return false;
+  if (!id || !label) {
+    return null;
   }
   const status = stringField(item, 'status');
-  return status === 'restoring' || status === 'failed';
+  if (status === 'restoring') {
+    return { id, label, status };
+  }
+  if (status === 'failed') {
+    return { id, label, status, error: stringField(item, 'error') };
+  }
+  const url = stringField(item, 'url');
+  const createdAt = stringField(item, 'createdAt');
+  return url && createdAt
+    ? { id, label, status: 'open', url, title: stringField(item, 'title'), createdAt }
+    : null;
 }
 
 function parseSessions(body: unknown): SessionSummary[] | null {
@@ -50,16 +52,37 @@ function parseSessions(body: unknown): SessionSummary[] | null {
     return null;
   }
   const items: unknown[] = body.sessions;
-  const sessions = items.filter((item) => !isPending(item)).map(parseSession);
+  const sessions = items.map(parseSession);
   return sessions.every((session): session is SessionSummary => session !== null) ? sessions : null;
+}
+
+// Why the server cannot save its PR list, if it cannot: GET /api/server-info prList.warning.
+function parsePrListWarning(body: unknown): string | null {
+  if (typeof body !== 'object' || body === null) {
+    return null;
+  }
+  const prList: unknown = Reflect.get(body, 'prList');
+  return (typeof prList === 'object' && prList !== null && stringField(prList, 'warning')) || null;
 }
 
 export function SessionList() {
   const [sessions, setSessions] = useState<SessionSummary[] | null>(null);
   const [listError, setListError] = useState<string | null>(null);
   const [closeError, setCloseError] = useState<string | null>(null);
+  const [prListWarning, setPrListWarning] = useState<string | null>(null);
+
+  // The list works without it, so a failed read keeps the last warning until the next poll.
+  const refreshWarning = useCallback(async () => {
+    try {
+      const response = await fetch('/api/server-info');
+      if (response.ok) {
+        setPrListWarning(parsePrListWarning(await response.json()));
+      }
+    } catch {}
+  }, []);
 
   const refresh = useCallback(async () => {
+    void refreshWarning();
     try {
       const response = await fetch('/api/sessions');
       const list = response.ok ? parseSessions(await response.json()) : null;
@@ -71,7 +94,7 @@ export function SessionList() {
     } catch {
       setListError('Could not load the open pull requests. Retrying…');
     }
-  }, []);
+  }, [refreshWarning]);
 
   // Polling is enough for a list that changes only when someone adds or closes a PR.
   // A hidden tab stops polling and catches up when shown again.
@@ -129,6 +152,15 @@ export function SessionList() {
           <h1 className="text-xl font-semibold">Open pull requests</h1>
         </header>
 
+        {prListWarning && (
+          <p
+            role="alert"
+            className="mb-4 rounded border border-github-warning px-4 py-2 text-sm text-github-warning"
+          >
+            {prListWarning}
+          </p>
+        )}
+
         {[listError, closeError].map(
           (message) =>
             message && (
@@ -157,28 +189,48 @@ export function SessionList() {
           <ul className="divide-y divide-github-border rounded-lg border border-github-border">
             {sessions.map((session) => (
               <li key={session.id} className="flex items-center gap-4 px-4 py-3">
-                <a href={session.url} className="min-w-0 flex-1 hover:underline">
-                  <span className="block font-mono text-sm text-github-text-secondary">
-                    {session.label}
-                  </span>
-                  {session.title && (
-                    <span className="block truncate font-medium">{session.title}</span>
-                  )}
-                </a>
-                <time
-                  dateTime={session.createdAt}
-                  className="shrink-0 text-xs text-github-text-secondary"
-                >
-                  {new Date(session.createdAt).toLocaleString()}
-                </time>
-                <button
-                  type="button"
-                  onClick={() => void close(session)}
-                  aria-label={`Close ${session.label}`}
-                  className="shrink-0 rounded border border-github-border px-3 py-1 text-sm text-github-text-secondary transition-colors hover:border-github-danger hover:text-github-danger"
-                >
-                  Close
-                </button>
+                {session.status === 'open' ? (
+                  <>
+                    <a href={session.url} className="min-w-0 flex-1 hover:underline">
+                      <span className="block font-mono text-sm text-github-text-secondary">
+                        {session.label}
+                      </span>
+                      {session.title && (
+                        <span className="block truncate font-medium">{session.title}</span>
+                      )}
+                    </a>
+                    <time
+                      dateTime={session.createdAt}
+                      className="shrink-0 text-xs text-github-text-secondary"
+                    >
+                      {new Date(session.createdAt).toLocaleString()}
+                    </time>
+                  </>
+                ) : (
+                  <div className="min-w-0 flex-1">
+                    <span className="block font-mono text-sm text-github-text-secondary">
+                      {session.label}
+                    </span>
+                    {session.status === 'restoring' ? (
+                      <span className="block text-sm text-github-text-secondary">Restoring…</span>
+                    ) : (
+                      <span className="block text-sm text-github-danger">
+                        <span className="font-medium">Failed</span>{' '}
+                        {session.error && <span>{session.error}</span>}
+                      </span>
+                    )}
+                  </div>
+                )}
+                {session.status !== 'restoring' && (
+                  <button
+                    type="button"
+                    onClick={() => void close(session)}
+                    aria-label={`Close ${session.label}`}
+                    className="shrink-0 rounded border border-github-border px-3 py-1 text-sm text-github-text-secondary transition-colors hover:border-github-danger hover:text-github-danger"
+                  >
+                    Close
+                  </button>
+                )}
               </li>
             ))}
           </ul>
