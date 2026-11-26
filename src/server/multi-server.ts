@@ -11,7 +11,7 @@ import pkg from '../../package.json' with { type: 'json' };
 import { type CommentImport } from '../types/diff.js';
 import { normalizeCommentImports } from '../utils/commentImports.js';
 
-import { type PrList, type SavedPullRequest } from './pr-list.js';
+import { type PrList, type ReviewState, type SavedPullRequest } from './pr-list.js';
 import {
   identifySession,
   labelOf,
@@ -100,6 +100,15 @@ function parseCreateSessionRequest(
   }
 }
 
+// A review mark is set to done, or back to none. Acknowledging has its own route.
+function parseReviewRequest(body: unknown): 'done' | 'none' | null {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return null;
+  }
+  const { state } = body as Record<string, unknown>;
+  return state === 'done' || state === 'none' ? state : null;
+}
+
 const maskTokens = (text: string) => text.replace(GITHUB_TOKEN_PATTERN, '[redacted]');
 
 // gh's messages help in the server log but could echo a token, so mask token shapes.
@@ -113,7 +122,7 @@ function describeErrorWithStack(error: unknown): string {
   return error instanceof Error && error.stack ? maskTokens(error.stack) : describeError(error);
 }
 
-const toSessionInfo = (entry: SessionEntry) => ({
+const toSessionInfo = (entry: SessionEntry, review: ReviewState) => ({
   id: entry.id,
   status: 'open' as const,
   url: `/s/${entry.id}/`,
@@ -121,11 +130,13 @@ const toSessionInfo = (entry: SessionEntry) => ({
   label: entry.label,
   title: entry.title,
   createdAt: entry.createdAt,
+  review,
+  commentCount: entry.session.commentCount,
 });
 
-// A saved PR without a session yet: it has no page, so no url.
-const toPendingInfo = ({ id, pr }: SavedPullRequest, error: string | undefined) => {
-  const row = { id, prUrl: pr.url, label: labelOf(pr) };
+// A saved PR without a session yet: it has no page, so no url, and no comments to count.
+const toPendingInfo = ({ id, pr, review }: SavedPullRequest, error: string | undefined) => {
+  const row = { id, prUrl: pr.url, label: labelOf(pr), review };
   return error === undefined
     ? { ...row, status: 'restoring' as const }
     : { ...row, status: 'failed' as const, error };
@@ -371,8 +382,11 @@ export function createMultiSessionApp({
 
   const describeSaved = (saved: SavedPullRequest) => {
     const entry = sessions.get(saved.id);
-    return entry ? toSessionInfo(entry) : toPendingInfo(saved, failed.get(saved.id));
+    return entry ? toSessionInfo(entry, saved.review) : toPendingInfo(saved, failed.get(saved.id));
   };
+
+  // An open session is always saved: it is added to the list before its creation settles.
+  const reviewOf = (id: string): ReviewState => prList.get(id)?.review ?? { state: 'none' };
 
   const app = express();
   app.use(guardRequest);
@@ -403,7 +417,7 @@ export function createMultiSessionApp({
     }
     try {
       const { entry, created } = await openSession(parsed.value);
-      res.status(created ? 201 : 200).json(toSessionInfo(entry));
+      res.status(created ? 201 : 200).json(toSessionInfo(entry, reviewOf(entry.id)));
     } catch (error) {
       const label = labelOf(parsed.value.pr);
       if (error instanceof PullRequestFetchError) {
@@ -435,6 +449,43 @@ export function createMultiSessionApp({
     await prList.remove(id);
     await entry?.session.dispose();
     res.json({ success: true, id });
+  });
+
+  // Marks a saved PR as reviewed, or clears the mark. The list is saved before the answer.
+  app.put('/api/sessions/:id/review', requireJsonContentType, async (req, res) => {
+    const { id } = req.params;
+    if (!prList.has(id)) {
+      res.status(404).json({ error: 'Unknown session' });
+      return;
+    }
+    const state = parseReviewRequest(req.body);
+    if (!state) {
+      res.status(400).json({ error: 'state must be "done" or "none"' });
+      return;
+    }
+    const saving = state === 'done' ? prList.markDone(id) : prList.unmark(id);
+    const review = reviewOf(id);
+    await saving;
+    res.json({ success: true, id, review });
+  });
+
+  // A bot takes the mark: a done review becomes acknowledged, once.
+  app.post('/api/sessions/:id/review/ack', requireJsonContentType, async (req, res) => {
+    const { id } = req.params;
+    if (!prList.has(id)) {
+      res.status(404).json({ error: 'Unknown session' });
+      return;
+    }
+    if (reviewOf(id).state !== 'done') {
+      res.status(409).json({
+        error: 'The review is not done (it is not marked, or it was acknowledged already)',
+      });
+      return;
+    }
+    const saving = prList.acknowledge(id);
+    const review = reviewOf(id);
+    await saving;
+    res.json({ success: true, id, review });
   });
 
   app.get('/', (_req, res) => {

@@ -1,6 +1,8 @@
 // The list of PRs the multi-session server has open, kept in a JSON file so that a
 // restarted server reopens them:
 //   { "version": 1, "pullRequests": [{ "url": "https://github.com/...", "addedAt": "<ISO>" }] }
+// A row may also carry a review mark: "review": { "state": "done", "doneAt": "<ISO>" }, or
+// "state": "acknowledged" with "acknowledgedAt" too. A row without one is not marked.
 // Rows come oldest first. A file it cannot read as that shape is never overwritten.
 import { promises as fs } from 'fs';
 import { basename, dirname, join } from 'path';
@@ -8,10 +10,20 @@ import { basename, dirname, join } from 'path';
 import { identifySession, parsePullRequestUrl, type PullRequestRef } from './pull-request-url.js';
 import { getUserConfigPath } from './user-config.js';
 
+/**
+ * Whether the user has finished reviewing the PR: none until marked done; acknowledged once
+ * a bot has taken the mark. Setting a PR back to none forgets both times.
+ */
+export type ReviewState =
+  | { readonly state: 'none' }
+  | { readonly state: 'done'; readonly doneAt: string }
+  | { readonly state: 'acknowledged'; readonly doneAt: string; readonly acknowledgedAt: string };
+
 export interface SavedPullRequest {
   readonly id: string;
   readonly pr: PullRequestRef;
   readonly addedAt: string;
+  readonly review: ReviewState;
 }
 
 export interface PrList {
@@ -26,6 +38,15 @@ export interface PrList {
   add(pr: PullRequestRef): Promise<void>;
   /** Drops the PR. Resolves once the file is written. */
   remove(id: string): Promise<void>;
+  /**
+   * Marks a PR that is not marked yet as done now. A done or acknowledged PR keeps its mark,
+   * so doneAt stays the same. Resolves once the file is written.
+   */
+  markDone(id: string): Promise<void>;
+  /** Turns a done PR into an acknowledged one. Any other PR is left as it is. */
+  acknowledge(id: string): Promise<void>;
+  /** Sets a done or acknowledged PR back to none, forgetting its times. */
+  unmark(id: string): Promise<void>;
   /**
    * Waits for in-flight and queued saves to complete, up to the timeout. Returns true if all
    * saves finished, false if the timeout elapsed.
@@ -83,6 +104,22 @@ const readOnly = (problem: string): Contents => ({
   unreadable: [],
 });
 
+const isDateString = (value: unknown): value is string =>
+  typeof value === 'string' && !Number.isNaN(Date.parse(value));
+
+// A mark it cannot read is no mark: the PR still opens, and the next save drops the mark.
+function parseReview(value: unknown): ReviewState {
+  if (isPlainObject(value) && isDateString(value.doneAt)) {
+    if (value.state === 'done') {
+      return { state: 'done', doneAt: value.doneAt };
+    }
+    if (value.state === 'acknowledged' && isDateString(value.acknowledgedAt)) {
+      return { state: 'acknowledged', doneAt: value.doneAt, acknowledgedAt: value.acknowledgedAt };
+    }
+  }
+  return { state: 'none' };
+}
+
 function parseRow(row: unknown): SavedPullRequest | null {
   if (
     !isPlainObject(row) ||
@@ -92,7 +129,9 @@ function parseRow(row: unknown): SavedPullRequest | null {
     return null;
   }
   const pr = parsePullRequestUrl(row.url);
-  return pr ? { id: identifySession(pr).id, pr, addedAt: row.addedAt } : null;
+  return pr
+    ? { id: identifySession(pr).id, pr, addedAt: row.addedAt, review: parseReview(row.review) }
+    : null;
 }
 
 async function readContents(path: string): Promise<Contents> {
@@ -173,7 +212,11 @@ export async function openPrList(path: string): Promise<PrList> {
     const contents = {
       version: FILE_VERSION,
       pullRequests: [
-        ...Array.from(saved.values(), ({ pr, addedAt }) => ({ url: pr.url, addedAt })),
+        ...Array.from(saved.values(), ({ pr, addedAt, review }) => ({
+          url: pr.url,
+          addedAt,
+          ...(review.state === 'none' ? {} : { review }),
+        })),
         ...unreadable,
       ],
     };
@@ -200,6 +243,17 @@ export async function openPrList(path: string): Promise<PrList> {
     return lastSave;
   }
 
+  // Replaces the review mark of a saved PR, if it is saved and `change` gives a new one.
+  function review(id: string, change: (current: ReviewState) => ReviewState | undefined) {
+    const current = saved.get(id);
+    const next = current && change(current.review);
+    if (!current || !next) {
+      return Promise.resolve();
+    }
+    saved.set(id, { ...current, review: next });
+    return save();
+  }
+
   return {
     path,
     warning: () => (access.kind === 'read-only' ? access.warning : saveError),
@@ -211,12 +265,24 @@ export async function openPrList(path: string): Promise<PrList> {
       if (saved.has(id)) {
         return Promise.resolve();
       }
-      saved.set(id, { id, pr, addedAt: new Date().toISOString() });
+      saved.set(id, { id, pr, addedAt: new Date().toISOString(), review: { state: 'none' } });
       return save();
     },
     remove(id) {
       return saved.delete(id) ? save() : Promise.resolve();
     },
+    markDone: (id) =>
+      review(id, (current) =>
+        current.state === 'none' ? { state: 'done', doneAt: new Date().toISOString() } : undefined,
+      ),
+    acknowledge: (id) =>
+      review(id, (current) =>
+        current.state === 'done'
+          ? { ...current, state: 'acknowledged', acknowledgedAt: new Date().toISOString() }
+          : undefined,
+      ),
+    unmark: (id) =>
+      review(id, (current) => (current.state === 'none' ? undefined : { state: 'none' })),
     async flush(timeoutMs) {
       if (access.kind === 'read-only') {
         return true;

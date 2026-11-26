@@ -139,6 +139,8 @@ interface ReviewSessionHooks {
 export interface ReviewSession {
   readonly router: Router;
   readonly isEmpty: boolean;
+  /** How many comment threads the session holds for its current diff selection. */
+  readonly commentCount: number;
   startWatching(): Promise<void>;
   outputFinalComments(): void;
   // Same effect as POST /api/comment-imports for the current selection.
@@ -844,6 +846,11 @@ export async function createReviewSession(
   const handle: ReviewSession = {
     router: app,
     isEmpty: initialDiffData.isEmpty || false,
+    get commentCount() {
+      return (
+        commentSessions.get(createCommentSessionKey(currentCommentSelection))?.threads.length ?? 0
+      );
+    },
     startWatching: async () => {
       if (options.diffMode) {
         await fileWatcher.start(options.diffMode, repositoryPath, 300, invalidateCache);
