@@ -307,6 +307,8 @@ describe('POST /api/sessions', () => {
       label: 'octo/alpha#1',
       title: `Title of ${PR_A}`,
       createdAt: expect.any(String),
+      review: { state: 'none' },
+      commentCount: 2,
     });
     expect(new Date(body.createdAt!).toISOString()).toBe(body.createdAt);
     expect(github.getPrPatch).toHaveBeenCalledWith(PR_A);
@@ -984,8 +986,20 @@ describe('restoring the saved PR list', () => {
     const { base, restoreSessions } = await startApp(github, { prsPath });
 
     expect(await listSessions(base)).toEqual([
-      { id: expect.any(String), status: 'restoring', prUrl: PR_A, label: 'octo/alpha#1' },
-      { id: expect.any(String), status: 'restoring', prUrl: PR_B, label: 'octo/beta#2' },
+      {
+        id: expect.any(String),
+        status: 'restoring',
+        prUrl: PR_A,
+        label: 'octo/alpha#1',
+        review: { state: 'none' },
+      },
+      {
+        id: expect.any(String),
+        status: 'restoring',
+        prUrl: PR_B,
+        label: 'octo/beta#2',
+        review: { state: 'none' },
+      },
     ]);
     expect(github.getPrSummary).not.toHaveBeenCalled();
 
@@ -1062,6 +1076,7 @@ describe('restoring the saved PR list', () => {
       prUrl,
       label,
       error: GH_FAILURE,
+      review: { state: 'none' },
     });
     expect(JSON.parse(text).sessions.slice(1)).toEqual([
       failedRow(PR_B, 'octo/beta#2'),
@@ -1173,6 +1188,268 @@ describe('restoring the saved PR list', () => {
     expect((await creation).status).toBe(201);
     expect(await statuses(base)).toEqual([[PR_A, 'open']]);
     expect(await savedUrls(prsPath)).toEqual([PR_A]);
+  });
+});
+
+describe('the review state of a PR', () => {
+  const putReview = (base: string, id: string, body: unknown) =>
+    fetch(`${base}/api/sessions/${id}/review`, {
+      method: 'PUT',
+      headers: jsonHeaders,
+      body: JSON.stringify(body),
+    });
+  const ackReview = (base: string, id: string) =>
+    fetch(`${base}/api/sessions/${id}/review/ack`, { method: 'POST', headers: jsonHeaders });
+  const reviewOf = async (base: string, id: string) =>
+    ((await listSessions(base)).find((row) => row.id === id) as SessionRow & { review: unknown })
+      .review;
+  const fileReviewOf = async (prsPath: string) =>
+    (await readPrsFile(prsPath)).pullRequests.map((row: { review?: unknown }) => row.review);
+
+  async function statuses(base: string) {
+    return (await listSessions(base)).map((row) => [
+      row.prUrl,
+      row.status,
+      (row as SessionRow & { review: { state: string } }).review.state,
+    ]);
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('lists every PR with its review state, none until marked', async () => {
+    const { base } = await startApp();
+    const a = await openPr(base, PR_A);
+
+    expect(await reviewOf(base, a.id)).toEqual({ state: 'none' });
+  });
+
+  it('marks a PR done with the time of the mark, saved to the file before the answer', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-02-03T04:05:06.000Z'));
+    const { base, prsPath } = await startApp();
+    const a = await openPr(base, PR_A);
+    const b = await openPr(base, PR_B);
+
+    const response = await putReview(base, a.id, { state: 'done' });
+
+    const done = { state: 'done', doneAt: '2026-02-03T04:05:06.000Z' };
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ success: true, id: a.id, review: done });
+    expect(await fileReviewOf(prsPath)).toEqual([done, undefined]);
+    expect(await reviewOf(base, a.id)).toEqual(done);
+    expect(await reviewOf(base, b.id)).toEqual({ state: 'none' });
+  });
+
+  it('keeps the time of the first mark when a done PR is marked done again', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-02-03T04:05:06.000Z'));
+    const { base } = await startApp();
+    const a = await openPr(base, PR_A);
+    await putReview(base, a.id, { state: 'done' });
+
+    vi.setSystemTime(new Date('2026-02-03T09:00:00.000Z'));
+    const again = await putReview(base, a.id, { state: 'done' });
+
+    expect(again.status).toBe(200);
+    expect(await reviewOf(base, a.id)).toEqual({
+      state: 'done',
+      doneAt: '2026-02-03T04:05:06.000Z',
+    });
+  });
+
+  it('sets a PR back to none, dropping the times, and a new mark gets a new time', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-02-03T04:05:06.000Z'));
+    const { base, prsPath } = await startApp();
+    const a = await openPr(base, PR_A);
+    await putReview(base, a.id, { state: 'done' });
+    await ackReview(base, a.id);
+
+    const response = await putReview(base, a.id, { state: 'none' });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ success: true, id: a.id, review: { state: 'none' } });
+    expect(await reviewOf(base, a.id)).toEqual({ state: 'none' });
+    expect(await fileReviewOf(prsPath)).toEqual([undefined]);
+
+    vi.setSystemTime(new Date('2026-02-04T00:00:00.000Z'));
+    await putReview(base, a.id, { state: 'done' });
+    expect(await reviewOf(base, a.id)).toEqual({
+      state: 'done',
+      doneAt: '2026-02-04T00:00:00.000Z',
+    });
+  });
+
+  it('acknowledges a done PR once: 200 the first time, 409 after, and 409 for a PR not done', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-02-03T04:05:06.000Z'));
+    const { base, prsPath } = await startApp();
+    const a = await openPr(base, PR_A);
+
+    const early = await ackReview(base, a.id);
+    expect(early.status).toBe(409);
+    expect(await reviewOf(base, a.id)).toEqual({ state: 'none' });
+
+    await putReview(base, a.id, { state: 'done' });
+    vi.setSystemTime(new Date('2026-02-03T05:00:00.000Z'));
+    const first = await ackReview(base, a.id);
+    const acknowledged = {
+      state: 'acknowledged',
+      doneAt: '2026-02-03T04:05:06.000Z',
+      acknowledgedAt: '2026-02-03T05:00:00.000Z',
+    };
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({ success: true, id: a.id, review: acknowledged });
+    expect(await fileReviewOf(prsPath)).toEqual([acknowledged]);
+
+    const second = await ackReview(base, a.id);
+    expect(second.status).toBe(409);
+    expect(await second.json()).toEqual({ error: expect.stringContaining('done') });
+    expect(await reviewOf(base, a.id)).toEqual(acknowledged);
+  });
+
+  it('keeps an acknowledged PR acknowledged when it is marked done again', async () => {
+    const { base } = await startApp();
+    const a = await openPr(base, PR_A);
+    await putReview(base, a.id, { state: 'done' });
+    await ackReview(base, a.id);
+    const acknowledged = await reviewOf(base, a.id);
+
+    const again = await putReview(base, a.id, { state: 'done' });
+
+    expect(again.status).toBe(200);
+    expect(await reviewOf(base, a.id)).toEqual(acknowledged);
+    expect(acknowledged).toMatchObject({ state: 'acknowledged' });
+  });
+
+  it('answers 404 for an unknown PR and 400 for a body that is not done or none', async () => {
+    const { base, prsPath } = await startApp();
+    const a = await openPr(base, PR_A);
+
+    expect((await putReview(base, 'unknown-id', { state: 'done' })).status).toBe(404);
+    expect((await ackReview(base, 'unknown-id')).status).toBe(404);
+    for (const body of [{ state: 'acknowledged' }, { state: 'DONE' }, { state: 1 }, {}, []]) {
+      const response = await putReview(base, a.id, body);
+      expect(response.status, JSON.stringify(body)).toBe(400);
+      expect(await response.json()).toEqual({ error: expect.stringContaining('done') });
+    }
+    // The JSON parser itself refuses a bare string or null.
+    for (const body of ['done', null]) {
+      expect((await putReview(base, a.id, body)).status, JSON.stringify(body)).toBe(400);
+    }
+    expect(await reviewOf(base, a.id)).toEqual({ state: 'none' });
+    expect(await fileReviewOf(prsPath)).toEqual([undefined]);
+  });
+
+  it('marks a saved PR that is still restoring or has failed', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const added = (day: number) => `2026-01-0${day}T00:00:00.000Z`;
+    const prsPath = await writePrsFile([
+      { url: PR_A, addedAt: added(1) },
+      { url: PR_B, addedAt: added(2) },
+    ]);
+    const github = fakeGitHub();
+    github.getPrSummary.mockImplementation(async (prUrl) => {
+      if (prUrl === PR_B) {
+        throw new Error('gh failed');
+      }
+      return { title: undefined, state: 'OPEN' };
+    });
+    const { base, restoreSessions } = await startApp(github, { prsPath });
+    const [a, b] = await listSessions(base);
+
+    expect((await putReview(base, a!.id, { state: 'done' })).status).toBe(200);
+    await restoreSessions();
+    expect((await putReview(base, b!.id, { state: 'done' })).status).toBe(200);
+
+    expect(await statuses(base)).toEqual([
+      [PR_A, 'open', 'done'],
+      [PR_B, 'failed', 'done'],
+    ]);
+    expect(await fileReviewOf(prsPath)).toEqual([
+      { state: 'done', doneAt: expect.any(String) },
+      { state: 'done', doneAt: expect.any(String) },
+    ]);
+  });
+
+  it('gives the state back after a restart, and drops it when the PR is closed', async () => {
+    const first = await startApp();
+    const a = await openPr(first.base, PR_A);
+    const b = await openPr(first.base, PR_B);
+    await putReview(first.base, a.id, { state: 'done' });
+    await putReview(first.base, b.id, { state: 'done' });
+    await ackReview(first.base, b.id);
+    const before = [await reviewOf(first.base, a.id), await reviewOf(first.base, b.id)];
+
+    const second = await startApp(fakeGitHub(), { prsPath: first.prsPath });
+    expect(await statuses(second.base)).toEqual([
+      [PR_A, 'restoring', 'done'],
+      [PR_B, 'restoring', 'acknowledged'],
+    ]);
+    await second.restoreSessions();
+
+    expect(before).toEqual([
+      { state: 'done', doneAt: expect.any(String) },
+      { state: 'acknowledged', doneAt: expect.any(String), acknowledgedAt: expect.any(String) },
+    ]);
+    expect([await reviewOf(second.base, a.id), await reviewOf(second.base, b.id)]).toEqual(before);
+
+    await deleteSession(second.base, a.id);
+    const reopened = await openPr(second.base, PR_A);
+    expect(await reviewOf(second.base, reopened.id)).toEqual({ state: 'none' });
+  });
+
+  it('reports how many comment threads each open session holds, and none for a PR not open yet', async () => {
+    const prsPath = await writePrsFile([{ url: PR_B, addedAt: '2026-01-01T00:00:00.000Z' }]);
+    const github = fakeGitHub();
+    github.getPrCommentImports.mockResolvedValue([
+      commentImport('gh-1', 'alpha.ts', 'from GitHub'),
+    ]);
+    const { base } = await startApp(github, { prsPath });
+    const a = await openPr(base, PR_A);
+
+    const count = async () =>
+      (await listSessions(base)).map(
+        (row) => (row as SessionRow & { commentCount?: number }).commentCount,
+      );
+    expect(await count()).toEqual([undefined, 1]);
+
+    await postComments(`${base}${a.url}api/comments`, [
+      makeThread('t1', 'alpha.ts', 'one'),
+      makeThread('t2', 'alpha.ts', 'two'),
+    ]);
+    expect(await count()).toEqual([undefined, 2]);
+  });
+
+  it('requires the JSON content type and a same-origin request, as other session writes do', async () => {
+    const { base, port } = await startApp();
+    const a = await openPr(base, PR_A);
+    const host = `127.0.0.1:${port}`;
+
+    const textPut = await fetch(`${base}/api/sessions/${a.id}/review`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify({ state: 'done' }),
+    });
+    const bareAck = await fetch(`${base}/api/sessions/${a.id}/review/ack`, { method: 'POST' });
+    const foreignPut = await rawRequest(port, {
+      method: 'PUT',
+      path: `/api/sessions/${a.id}/review`,
+      headers: { Host: host, Origin: 'http://evil.example', ...jsonHeaders },
+      body: JSON.stringify({ state: 'done' }),
+    });
+    const wrongHost = await rawRequest(port, {
+      method: 'POST',
+      path: `/api/sessions/${a.id}/review/ack`,
+      headers: { Host: 'evil.example', ...jsonHeaders },
+    });
+
+    expect([textPut.status, bareAck.status, foreignPut.status, wrongHost.status]).toEqual([
+      415, 415, 403, 403,
+    ]);
+    expect(await reviewOf(base, a.id)).toEqual({ state: 'none' });
   });
 });
 

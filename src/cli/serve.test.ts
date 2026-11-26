@@ -13,6 +13,7 @@ import { fetch } from 'undici';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import pkg from '../../package.json' with { type: 'json' };
+import { sessionIdForPullRequest } from '../server/pull-request-url.js';
 
 const PR_A = 'https://github.com/octo/alpha/pull/1';
 const PR_B = 'https://github.com/octo/beta/pull/2';
@@ -861,5 +862,352 @@ describe('difit comment', () => {
 
     expect(result.code).toBe(1);
     expect(result.stderr).toMatch(/--session/);
+  });
+});
+
+describe('difit review', () => {
+  const putReview = (base: string, id: string, state: 'done' | 'none') =>
+    fetch(`${base}/api/sessions/${id}/review`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ state }),
+    });
+
+  async function serveWithTwoPrs() {
+    const { base } = await serve();
+    await runCli(['--pr', PR_A, '--no-open']);
+    await runCli(['--pr', PR_B, '--no-open']);
+    const [a, b] = await listSessions(base);
+    if (!a || !b) {
+      throw new Error('no sessions');
+    }
+    return { base, a, b };
+  }
+
+  const listed = async (...args: string[]) => {
+    const result = await runCli(['review', 'list', '--json', ...args]);
+    expect(result.stderr).toBe('');
+    expect(result.code).toBe(0);
+    return JSON.parse(result.stdout) as Array<Record<string, unknown>>;
+  };
+
+  // A server that answers server-info as the difit server of this process and sessions
+  // with the given rows, recording every request.
+  async function startFakeDifit(sessions: unknown[], answer: { status: number; body: unknown }) {
+    const requests: string[] = [];
+    const server = createServer((req, res) => {
+      requests.push(`${req.method} ${req.url} ${req.headers['content-type'] ?? ''}`.trim());
+      res.writeHead(
+        req.url === '/api/server-info' || req.url === '/api/sessions' ? 200 : answer.status,
+        {
+          'Content-Type': 'application/json',
+        },
+      );
+      res.end(
+        JSON.stringify(
+          req.url === '/api/server-info'
+            ? { app: 'difit', mode: 'multi', pid: process.pid }
+            : req.url === '/api/sessions'
+              ? { sessions }
+              : answer.body,
+        ),
+      );
+    });
+    otherServers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, 'localhost', resolve));
+    await writeState({
+      pid: process.pid,
+      host: 'localhost',
+      port: (server.address() as AddressInfo).port,
+    });
+    return requests;
+  }
+
+  const row = (extra: Record<string, unknown>) => ({
+    id: 'aaaaaaaaaaaaaaaa',
+    prUrl: PR_A,
+    label: 'octo/alpha#1',
+    status: 'open',
+    url: '/s/aaaaaaaaaaaaaaaa/',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    review: { state: 'none' },
+    commentCount: 0,
+    ...extra,
+  });
+
+  it('is a subcommand listed by --help, so a script can tell it exists before calling it', async () => {
+    const written: string[] = [];
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk: string | Uint8Array) => {
+      written.push(String(chunk));
+      return true;
+    });
+
+    const root = await runCli(['--help']);
+    const review = await runCli(['review', '--help']);
+    const list = await runCli(['review', 'list', '--help']);
+
+    expect([root.code, review.code, list.code]).toEqual([0, 0, 0]);
+    const [rootHelp = '', reviewHelp = '', listHelp = ''] = written
+      .join('')
+      .split(/(?=^Usage: difit)/m);
+    expect(rootHelp).toMatch(/^Commands:\n(?:  .*\n)*?  review\b/m);
+    expect(reviewHelp).toMatch(/^Commands:\n(?:  .*\n)*?  list\b(?:.*\n)(?:  .*\n)*?  ack\b/m);
+    expect(listHelp).toMatch(/--done/);
+    expect(listHelp).toMatch(/--json/);
+  });
+
+  describe('list', () => {
+    it('prints url, id, label, doneAt, and commentCount of the PRs marked done', async () => {
+      const { base, a, b } = await serveWithTwoPrs();
+      await runCli(['comment', 'add', '--pr', PR_A, comment('t1', 'first')]);
+      await runCli(['comment', 'add', '--pr', PR_A, comment('t2', 'second')]);
+      expect(await listed('--done')).toEqual([]);
+
+      expect((await putReview(base, a.id, 'done')).status).toBe(200);
+
+      const done = await listed('--done');
+      expect(done).toEqual([
+        {
+          url: PR_A,
+          id: a.id,
+          label: 'octo/alpha#1',
+          doneAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+          commentCount: 2,
+          state: 'done',
+        },
+      ]);
+      expect(Object.keys(done[0] ?? {})).toEqual(
+        expect.arrayContaining(['url', 'id', 'label', 'doneAt', 'commentCount']),
+      );
+      const everyone = await listed();
+      expect(everyone.map((entry) => [entry.id, entry.state, entry.doneAt])).toEqual([
+        [a.id, 'done', done[0]?.doneAt],
+        [b.id, 'none', null],
+      ]);
+    });
+
+    it('leaves out PRs that are acknowledged or not marked', async () => {
+      const { base, a, b } = await serveWithTwoPrs();
+      await putReview(base, a.id, 'done');
+      await putReview(base, b.id, 'done');
+      await runCli(['review', 'ack', '--pr', PR_B]);
+
+      expect((await listed('--done')).map((entry) => entry.id)).toEqual([a.id]);
+      await putReview(base, a.id, 'none');
+      expect(await listed('--done')).toEqual([]);
+    });
+
+    it('lists a PR again when it is set back to none and marked done again', async () => {
+      const { base, a } = await serveWithTwoPrs();
+      await putReview(base, a.id, 'done');
+      const [first] = await listed('--done');
+      await runCli(['review', 'ack', '--pr', PR_A]);
+      expect(await listed('--done')).toEqual([]);
+
+      await putReview(base, a.id, 'none');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await putReview(base, a.id, 'done');
+
+      const [again] = await listed('--done');
+      expect(again).toMatchObject({ id: a.id });
+      expect(again?.doneAt).not.toBe(first?.doneAt);
+    });
+
+    it('keeps the done marks across difit stop and difit serve', async () => {
+      const { base, a } = await serveWithTwoPrs();
+      await putReview(base, a.id, 'done');
+      const [before] = await listed('--done');
+      expect((await runCli(['stop'])).code).toBe(0);
+
+      const { base: next } = await serve();
+      await restoredSessions(next);
+
+      expect(await listed('--done')).toEqual([before]);
+    });
+
+    it('prints [] and exits 0 when no server is running, without starting one or reading GitHub', async () => {
+      const none = await runCli(['review', 'list', '--done', '--json']);
+      await writeState({ pid: DEAD_PID });
+      const stale = await runCli(['review', 'list', '--done', '--json']);
+
+      for (const result of [none, stale]) {
+        expect(result.code).toBe(0);
+        expect(result.stdout).toBe('[]');
+        expect(result.stderr).toBe('');
+      }
+      expect(fakes.spawnBackgroundChild).not.toHaveBeenCalled();
+      expect(vi.mocked(startServer)).not.toHaveBeenCalled();
+    });
+
+    it('prints nothing in text mode when there is nothing to list', async () => {
+      const result = await runCli(['review', 'list', '--done']);
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toBe('');
+    });
+
+    it('prints one line per PR in text mode', async () => {
+      const { base, a } = await serveWithTwoPrs();
+      await putReview(base, a.id, 'done');
+
+      const result = await runCli(['review', 'list', '--done']);
+
+      expect(result.code).toBe(0);
+      expect(result.stdout.split('\n')).toEqual([expect.stringContaining(PR_A)]);
+      expect(result.stdout).toContain('octo/alpha#1');
+    });
+
+    it('skips a done PR whose session is not open yet, as its comments are not loaded', async () => {
+      const requests = await startFakeDifit(
+        [
+          row({ review: { state: 'done', doneAt: '2026-02-03T04:05:06.000Z' }, commentCount: 3 }),
+          row({
+            id: 'bbbbbbbbbbbbbbbb',
+            prUrl: PR_B,
+            label: 'octo/beta#2',
+            status: 'restoring',
+            url: undefined,
+            commentCount: undefined,
+            review: { state: 'done', doneAt: '2026-02-03T04:05:06.000Z' },
+          }),
+          row({
+            id: 'cccccccccccccccc',
+            prUrl: PR_C,
+            label: 'octo/gamma#3',
+            status: 'failed',
+            url: undefined,
+            commentCount: undefined,
+            error: 'x',
+            review: { state: 'done', doneAt: '2026-02-03T04:05:06.000Z' },
+          }),
+        ],
+        { status: 500, body: {} },
+      );
+
+      expect(await listed('--done')).toEqual([
+        {
+          url: PR_A,
+          id: 'aaaaaaaaaaaaaaaa',
+          label: 'octo/alpha#1',
+          doneAt: '2026-02-03T04:05:06.000Z',
+          commentCount: 3,
+          state: 'done',
+        },
+      ]);
+      expect(requests.filter((request) => !request.includes('server-info'))).toEqual([
+        'GET /api/sessions',
+      ]);
+    });
+
+    it('fails, and does not say there is nothing to list, when the server does not answer', async () => {
+      const port = await startUnresponsiveApp();
+      await writeState({ pid: process.pid, port });
+
+      const result = await runCli(['review', 'list', '--done', '--json']);
+
+      expect(result.code).toBe(1);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toMatch(/not answering/);
+    });
+  });
+
+  describe('ack', () => {
+    it('acknowledges the done PR of --pr, which then leaves list --done', async () => {
+      const { base, a } = await serveWithTwoPrs();
+      await putReview(base, a.id, 'done');
+
+      const result = await runCli(['review', 'ack', '--pr', PR_A]);
+
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        id: a.id,
+        url: PR_A,
+        state: 'acknowledged',
+        acknowledgedAt: expect.any(String),
+      });
+      expect(await listed('--done')).toEqual([]);
+      const rows = (await (await fetch(`${base}/api/sessions`)).json()) as {
+        sessions: Array<{ id: string; review: { state: string } }>;
+      };
+      expect(rows.sessions.map((session) => session.review.state)).toEqual([
+        'acknowledged',
+        'none',
+      ]);
+    });
+
+    it('exits 1 when the PR is not done, or was acknowledged already', async () => {
+      const { base, a } = await serveWithTwoPrs();
+
+      const none = await runCli(['review', 'ack', '--pr', PR_A]);
+      await putReview(base, a.id, 'done');
+      const first = await runCli(['review', 'ack', '--pr', PR_A]);
+      const again = await runCli(['review', 'ack', '--pr', PR_A]);
+
+      expect(none.code).toBe(1);
+      expect(none.stderr).toMatch(/not done/i);
+      expect(first.code).toBe(0);
+      expect(again.code).toBe(1);
+      expect(again.stderr).toMatch(/not done/i);
+    });
+
+    it('exits 1 for a PR the server does not list', async () => {
+      await serveWithTwoPrs();
+
+      const result = await runCli(['review', 'ack', '--pr', PR_C]);
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toMatch(/not in the difit server's list|not on the server/i);
+    });
+
+    it('finds the PR from its pages, trailing slash, query, and fragment, as comment --pr does', async () => {
+      const { base, a } = await serveWithTwoPrs();
+      await putReview(base, a.id, 'done');
+
+      const result = await runCli(['review', 'ack', '--pr', `${PR_A}/files?x=1#y`]);
+
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({ id: a.id, url: PR_A });
+    });
+
+    it('rejects a GitHub Enterprise URL before asking any server, and needs --pr', async () => {
+      const requests = await startFakeDifit([], { status: 200, body: {} });
+
+      const ghe = await runCli([
+        'review',
+        'ack',
+        '--pr',
+        'https://ghe.example.internal/acme/widgets/pull/12',
+      ]);
+      const bare = await runCli(['review', 'ack']);
+
+      expect(ghe.code).toBe(1);
+      expect(ghe.stderr).toContain('--standalone');
+      expect(bare.code).toBe(1);
+      expect(bare.stderr).toMatch(/--pr/);
+      expect(requests.filter((request) => !request.includes('server-info'))).toEqual([]);
+    });
+
+    it('exits 1 and says so when no server is running', async () => {
+      const result = await runCli(['review', 'ack', '--pr', PR_A]);
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toMatch(/No difit server is running/);
+      expect(fakes.spawnBackgroundChild).not.toHaveBeenCalled();
+    });
+
+    it('posts to the review/ack route of the PR session with a JSON content type', async () => {
+      const requests = await startFakeDifit([], {
+        status: 200,
+        body: { success: true, id: 'aaaaaaaaaaaaaaaa', review: { state: 'acknowledged' } },
+      });
+
+      const result = await runCli(['review', 'ack', '--pr', PR_A]);
+
+      const id = sessionIdForPullRequest(PR_A);
+      expect(result.code).toBe(0);
+      expect(requests.filter((request) => !request.includes('server-info'))).toEqual([
+        `POST /api/sessions/${id}/review/ack application/json`,
+      ]);
+    });
   });
 });
