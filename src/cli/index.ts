@@ -21,6 +21,7 @@ import {
 } from './utils.js';
 import { createCommentCommand } from './comment.js';
 import { getPrPatch, getPrCommentImports } from './github.js';
+import { createReviewCommand } from './review.js';
 import { createServeCommand, createStopCommand, reviewOnServer } from './serve.js';
 import {
   BACKGROUND_CHILD_ENV,
@@ -102,6 +103,7 @@ program
   .version(pkg.version, '-v, --version', 'output the version number')
   .enablePositionalOptions()
   .addCommand(createCommentCommand())
+  .addCommand(createReviewCommand())
   .addCommand(createServeCommand())
   .addCommand(createStopCommand())
   .argument(

@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, rm, writeFile } from 'fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -263,5 +263,214 @@ describe('cleanup of stale temporary files on startup', () => {
 
     const files = await readdir(dir);
     expect(files.sort()).toEqual(['prs.json', `prs.json.${parentPid}.tmp`].sort());
+  });
+});
+
+describe('the review state of a saved PR', () => {
+  const ref = { url: PR_A, owner: 'octo', repo: 'alpha', number: 1 };
+  const ADDED_AT = '2026-01-01T00:00:00.000Z';
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function openWithPr() {
+    const prsPath = join(await makeTempDir(), 'prs.json');
+    const prList = await openPrList(prsPath);
+    await prList.add(ref);
+    const [saved] = prList.list();
+    if (!saved) {
+      throw new Error('PR not saved');
+    }
+    return { prsPath, prList, id: saved.id };
+  }
+
+  const rowsOf = async (prsPath: string) => JSON.parse(await readFile(prsPath, 'utf8'));
+
+  it('starts a new PR as none and writes no review key for it', async () => {
+    const { prsPath, prList, id } = await openWithPr();
+
+    expect(prList.get(id)?.review).toEqual({ state: 'none' });
+    expect((await rowsOf(prsPath)).pullRequests).toEqual([
+      { url: PR_A, addedAt: expect.any(String) },
+    ]);
+  });
+
+  it('marks a PR done with the time, in the file with version 1 unchanged', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-02-03T04:05:06.000Z'));
+    const { prsPath, prList, id } = await openWithPr();
+
+    await prList.markDone(id);
+
+    expect(prList.get(id)?.review).toEqual({ state: 'done', doneAt: '2026-02-03T04:05:06.000Z' });
+    expect(await rowsOf(prsPath)).toEqual({
+      version: 1,
+      pullRequests: [
+        {
+          url: PR_A,
+          addedAt: '2026-02-03T04:05:06.000Z',
+          review: { state: 'done', doneAt: '2026-02-03T04:05:06.000Z' },
+        },
+      ],
+    });
+  });
+
+  it('keeps the first doneAt when a done PR is marked done again', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-02-03T04:05:06.000Z'));
+    const { prList, id } = await openWithPr();
+    await prList.markDone(id);
+
+    vi.setSystemTime(new Date('2026-02-03T09:00:00.000Z'));
+    await prList.markDone(id);
+
+    expect(prList.get(id)?.review).toEqual({ state: 'done', doneAt: '2026-02-03T04:05:06.000Z' });
+  });
+
+  it('acknowledges only a done PR, recording when', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-02-03T04:05:06.000Z'));
+    const { prsPath, prList, id } = await openWithPr();
+
+    await prList.acknowledge(id);
+    expect(prList.get(id)?.review).toEqual({ state: 'none' });
+
+    await prList.markDone(id);
+    vi.setSystemTime(new Date('2026-02-03T05:00:00.000Z'));
+    await prList.acknowledge(id);
+
+    const acknowledged = {
+      state: 'acknowledged',
+      doneAt: '2026-02-03T04:05:06.000Z',
+      acknowledgedAt: '2026-02-03T05:00:00.000Z',
+    };
+    expect(prList.get(id)?.review).toEqual(acknowledged);
+    expect((await rowsOf(prsPath)).pullRequests[0].review).toEqual(acknowledged);
+  });
+
+  it('leaves an acknowledged PR acknowledged when it is marked done or acknowledged again', async () => {
+    const { prList, id } = await openWithPr();
+    await prList.markDone(id);
+    await prList.acknowledge(id);
+    const before = prList.get(id)?.review;
+
+    await prList.markDone(id);
+    await prList.acknowledge(id);
+
+    expect(before).toMatchObject({ state: 'acknowledged' });
+    expect(prList.get(id)?.review).toEqual(before);
+  });
+
+  it('forgets both times when a done or acknowledged PR is set back to none, and marks it done again with a new time', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-02-03T04:05:06.000Z'));
+    const { prsPath, prList, id } = await openWithPr();
+    await prList.markDone(id);
+    await prList.acknowledge(id);
+
+    await prList.unmark(id);
+
+    expect(prList.get(id)?.review).toEqual({ state: 'none' });
+    expect((await rowsOf(prsPath)).pullRequests[0]).toEqual({
+      url: PR_A,
+      addedAt: expect.any(String),
+    });
+
+    vi.setSystemTime(new Date('2026-02-04T00:00:00.000Z'));
+    await prList.markDone(id);
+    expect(prList.get(id)?.review).toEqual({ state: 'done', doneAt: '2026-02-04T00:00:00.000Z' });
+  });
+
+  it('does nothing, and writes nothing, for a PR that is not saved', async () => {
+    const prsPath = join(await makeTempDir(), 'prs.json');
+    const prList = await openPrList(prsPath);
+
+    await prList.markDone('0123456789ab');
+    await prList.acknowledge('0123456789ab');
+    await prList.unmark('0123456789ab');
+
+    expect(prList.list()).toEqual([]);
+    expect(await readdir(join(prsPath, '..'))).toEqual([]);
+  });
+
+  it('reads the review state back from the file, and treats a row without one as none', async () => {
+    const prsPath = join(await makeTempDir(), 'prs.json');
+    const done = { state: 'done', doneAt: '2026-02-03T04:05:06.000Z' };
+    const acknowledged = {
+      state: 'acknowledged',
+      doneAt: '2026-02-03T04:05:06.000Z',
+      acknowledgedAt: '2026-02-03T05:00:00.000Z',
+    };
+    await writeFile(
+      prsPath,
+      JSON.stringify({
+        version: 1,
+        pullRequests: [
+          { url: 'https://github.com/octo/a/pull/1', addedAt: ADDED_AT },
+          { url: 'https://github.com/octo/b/pull/2', addedAt: ADDED_AT, review: done },
+          { url: 'https://github.com/octo/c/pull/3', addedAt: ADDED_AT, review: acknowledged },
+          { url: 'https://github.com/octo/d/pull/4', addedAt: ADDED_AT, review: { state: 'none' } },
+        ],
+      }),
+    );
+
+    const prList = await openPrList(prsPath);
+
+    expect(prList.list().map((saved) => saved.review)).toEqual([
+      { state: 'none' },
+      done,
+      acknowledged,
+      { state: 'none' },
+    ]);
+  });
+
+  it('treats a review it cannot read as none, and still lists the PR', async () => {
+    const prsPath = join(await makeTempDir(), 'prs.json');
+    const bad = [
+      { state: 'reviewing' },
+      { state: 'done' },
+      { state: 'done', doneAt: 'yesterday' },
+      { state: 'acknowledged', doneAt: '2026-02-03T04:05:06.000Z' },
+      'done',
+      null,
+    ];
+    await writeFile(
+      prsPath,
+      JSON.stringify({
+        version: 1,
+        pullRequests: bad.map((review, index) => ({
+          url: `https://github.com/octo/r${index}/pull/1`,
+          addedAt: ADDED_AT,
+          review,
+        })),
+      }),
+    );
+
+    const prList = await openPrList(prsPath);
+
+    expect(prList.list().map((saved) => saved.review)).toEqual(bad.map(() => ({ state: 'none' })));
+  });
+
+  it('keeps the review of every PR when another PR is added or closed', async () => {
+    const { prsPath, prList, id } = await openWithPr();
+    await prList.markDone(id);
+
+    await prList.add({
+      url: 'https://github.com/octo/beta/pull/2',
+      owner: 'octo',
+      repo: 'beta',
+      number: 2,
+    });
+    const [, beta] = prList.list();
+    await prList.remove(beta?.id ?? '');
+
+    expect((await rowsOf(prsPath)).pullRequests).toEqual([
+      {
+        url: PR_A,
+        addedAt: expect.any(String),
+        review: { state: 'done', doneAt: expect.any(String) },
+      },
+    ]);
   });
 });
